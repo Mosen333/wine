@@ -73,6 +73,7 @@ BOOL use_system_cursors = TRUE;
 BOOL grab_fullscreen = FALSE;
 BOOL managed_mode = TRUE;
 BOOL decorate_tool_windows = TRUE;
+BOOL resize_unframed_windows = FALSE;
 BOOL private_color_map = FALSE;
 int primary_monitor = 0;
 BOOL client_side_graphics = TRUE;
@@ -461,6 +462,9 @@ static void setup_options(void)
 
     if (!get_config_key( hkey, appkey, "DecorateToolWindows", buffer, sizeof(buffer) ))
         decorate_tool_windows = IS_OPTION_TRUE( buffer[0] );
+
+    if (!get_config_key( hkey, appkey, "ResizeUnframedWindows", buffer, sizeof(buffer) ))
+        resize_unframed_windows = IS_OPTION_TRUE( buffer[0] );
 
     if (!get_config_key( hkey, appkey, "UseXVidMode", buffer, sizeof(buffer) ))
         usexvidmode = IS_OPTION_TRUE( buffer[0] );
