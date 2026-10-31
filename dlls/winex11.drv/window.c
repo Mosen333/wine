@@ -541,6 +541,12 @@ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, BOOL fullscreen )
 static inline BOOL is_window_resizable( struct x11drv_win_data *data, DWORD style )
 {
     if (data->is_resizable) return TRUE;
+    /* applications that draw their own frame (FL Studio) resize through WM_NCHITTEST
+     * without WS_THICKFRAME; optionally let the window manager resize their unowned,
+     * maximizable top-level windows too instead of pinning them to a fixed size.
+     * Popup menus (JUCE) and helper windows are unowned too but not maximizable. */
+    if (resize_unframed_windows && (style & WS_MAXIMIZEBOX) &&
+        !NtUserGetWindowRelative( data->hwnd, GW_OWNER )) return TRUE;
     /* Metacity needs the window to be resizable to make it fullscreen */
     return data->is_fullscreen;
 }
