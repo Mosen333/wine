@@ -5557,8 +5557,13 @@ BOOL WINAPI NtUserShowWindowAsync( HWND hwnd, INT cmd )
         return FALSE;
     }
 
+    /* unlike ShowWindow, the return value reports that the operation was
+     * started, not the previous visibility (Waves V17 plug-in editors check it) */
     if ((full_handle = is_current_thread_window( hwnd )))
-        return show_window( full_handle, cmd );
+    {
+        show_window( full_handle, cmd );
+        return TRUE;
+    }
 
     return NtUserMessageCall( hwnd, WM_WINE_SHOWWINDOW, cmd, 0, 0,
                               NtUserSendNotifyMessage, FALSE );
