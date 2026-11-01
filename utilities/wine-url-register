@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""Register URL schemes (x-scheme-handler MIME types) of Windows apps in a Wine prefix.
+
+Windows apps that use browser logins register a URL scheme (e.g. waves-central://)
+in the prefix registry. This reads those schemes, lets you pick which ones to hand
+to Linux, and creates a hidden .desktop entry for each, so the browser can pass the
+login link back to the app running in Wine.
+
+Links are delivered by ~/.local/bin/wine-url-handler (installed by this script). It
+joins the prefix's running wineserver if there is one - also inside a Bottles flatpak
+sandbox, whose /tmp is private - so the link reaches the app that is waiting for it.
+
+Usage:
+  wine-url-register [PREFIX]                 interactive
+  wine-url-register PREFIX --list            only list the schemes
+  wine-url-register PREFIX --add SCHEME...   register without prompting
+  wine-url-register PREFIX --remove SCHEME...
+Options: --wine BIN  wine binary for non-Bottles prefixes (default: wine in PATH)
+         --dry-run   show what would be done
+"""
+
+import argparse
+import ntpath
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+APPS_DIR = os.path.expanduser("~/.local/share/applications")
+HANDLER = os.path.expanduser("~/.local/bin/wine-url-handler")
+FLATPAK_BOTTLES = os.path.expanduser("~/.var/app/com.usebottles.bottles/")
+DESKTOP_PREFIX = "wine-url-"
+
+# schemes Linux already handles, and Wine's own forwarders to the Linux browser
+SKIP_SCHEMES = {"http", "https", "ftp", "mailto", "file", "news", "nntp", "telnet", "ldap", "callto"}
+SKIP_EXES = {"winebrowser.exe", "iexplore.exe", "rundll32.exe", "explorer.exe"}
+SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*$")
+
+HANDLER_SCRIPT = r'''#!/bin/bash
+# Passes a URL to a Windows app in a Wine prefix (installed by wine-url-register).
+# usage: wine-url-handler [--bottle NAME] [--bottles flatpak|native] [--wine BIN]
+#                         PREFIX EXE [ARG-TEMPLATE...] -- URL
+# %1, %l and %L in the argument template are replaced by the URL (appended if absent).
+# Set WINE_URL_HANDLER_DRYRUN=1 to print the command instead of running it.
+bottle= bottles= wine=wine
+while [[ $1 == --* ]]; do
+    case $1 in
+        --bottle) bottle=$2; shift 2 ;;
+        --bottles) bottles=$2; shift 2 ;;
+        --wine) wine=$2; shift 2 ;;
+        *) break ;;
+    esac
+done
+prefix=$1 exe=$2; shift 2
+template=()
+while (($#)) && [[ $1 != -- ]]; do template+=("$1"); shift; done
+shift; url=$1
+
+args=() used=0
+for t in "${template[@]}"; do
+    for p in %1 %l %L; do [[ $t == *"$p"* ]] && { t=${t//"$p"/"$url"}; used=1; }; done
+    args+=("$t")
+done
+((used)) || args+=("$url")
+
+run() {
+    if [[ -n $WINE_URL_HANDLER_DRYRUN ]]; then printf '%q ' "$@"; echo; exit 0; fi
+    exec "$@"
+}
+
+# find a wineserver already serving this prefix: its cwd is /tmp/.wine-UID/server-DEV-INODE
+key=$(printf 'server-%s-%x' "$(stat -L -c %D "$prefix")" "$(stat -L -c %i "$prefix")")
+for pid in $(pgrep -u "$UID" wineserver); do
+    [[ $(readlink "/proc/$pid/cwd") == */"$key" ]] || continue
+    wine_bin=$(dirname "$(readlink "/proc/$pid/exe")")/wine
+    mapfile -d '' env < "/proc/$pid/environ"
+    inst=$(sed -n 's/^instance-id=//p' "/proc/$pid/root/.flatpak-info" 2>/dev/null)
+    if [[ -n $inst ]]; then
+        run flatpak enter "$inst" env -i "${env[@]}" "$wine_bin" "$exe" "${args[@]}"
+    else
+        run env -i "${env[@]}" "$wine_bin" "$exe" "${args[@]}"
+    fi
+done
+
+# not running: start it normally
+case $bottles in
+    flatpak) run flatpak run --command=bottles-cli com.usebottles.bottles run -b "$bottle" -e "$exe" -- "${args[@]}" ;;
+    native)  run bottles-cli run -b "$bottle" -e "$exe" -- "${args[@]}" ;;
+    *)       run env WINEPREFIX="$prefix" "$wine" "$exe" "${args[@]}" ;;
+esac
+'''
+
+
+# ---------------------------------------------------------------- registry
+
+def unescape_reg(s):
+    out, i = [], 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and i + 1 < len(s):
+            n = s[i + 1]
+            if n == "x":
+                m = re.match(r"[0-9a-fA-F]{1,4}", s[i + 2:])
+                if m:
+                    out.append(chr(int(m.group(), 16)))
+                    i += 2 + len(m.group())
+                    continue
+            out.append({"n": "\n", "r": "\r", "t": "\t", "0": "\0"}.get(n, n))
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def parse_reg(path):
+    """Return {lowercase key path: {lowercase value name: string}} for string values."""
+    keys, cur = {}, None
+    value_re = re.compile(r'^(@|"((?:[^"\\]|\\.)*)")=(?:str\(2\):)?"((?:[^"\\]|\\.)*)"\s*$')
+    try:
+        f = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return keys
+    with f:
+        for line in f:
+            line = line.rstrip("\n")
+            if line.startswith("["):
+                end = line.rfind("]")
+                cur = keys.setdefault(unescape_reg(line[1:end]).lower(), {})
+                continue
+            if cur is None:
+                continue
+            m = value_re.match(line)
+            if m:
+                name = "@" if m.group(1) == "@" else unescape_reg(m.group(2)).lower()
+                cur[name] = unescape_reg(m.group(3))
+            elif line.startswith('"url protocol"=') or line.lower().startswith('"url protocol"='):
+                cur["url protocol"] = ""
+    return keys
+
+
+def find_schemes(prefix):
+    """Merge HKLM and HKCU classes (HKCU wins) and return the URL protocol handlers."""
+    classes = {}
+    for reg in ("system.reg", "user.reg"):
+        for key, values in parse_reg(os.path.join(prefix, reg)).items():
+            if key.startswith("software\\classes\\"):
+                classes[key[len("software\\classes\\"):]] = values
+    schemes = []
+    for name, values in classes.items():
+        if "\\" in name or "url protocol" not in values:
+            continue
+        command = classes.get(name + "\\shell\\open\\command", {}).get("@")
+        schemes.append({"scheme": name, "description": values.get("@", ""), "command": command})
+    return sorted(schemes, key=lambda s: s["scheme"])
+
+
+# ---------------------------------------------------------------- paths & commands
+
+def split_command(cmd):
+    """Split a Windows command line into (exe, [args]) without backslash escapes."""
+    cmd = cmd.strip()
+    if cmd.startswith('"'):
+        exe, _, rest = cmd[1:].partition('"')
+    else:
+        m = re.search(r"\.exe\b", cmd, re.I)
+        cut = m.end() if m else (cmd.find(" ") if " " in cmd else len(cmd))
+        exe, rest = cmd[:cut], cmd[cut:]
+    args = [a.replace('"', "") for a in re.findall(r'(?:"[^"]*"|[^\s"])+', rest)]
+    return exe, args
+
+
+def expand_env(path, prefix):
+    users = os.path.join(prefix, "drive_c", "users")
+    user = next((u for u in sorted(os.listdir(users)) if u.lower() not in ("public", "default")), "user") \
+        if os.path.isdir(users) else "user"
+    home = "C:\\users\\" + user
+    env = {"programfiles": "C:\\Program Files", "programfiles(x86)": "C:\\Program Files (x86)",
+           "programw6432": "C:\\Program Files", "commonprogramfiles": "C:\\Program Files\\Common Files",
+           "systemroot": "C:\\windows", "windir": "C:\\windows", "systemdrive": "C:",
+           "userprofile": home, "appdata": home + "\\AppData\\Roaming",
+           "localappdata": home + "\\AppData\\Local", "programdata": "C:\\ProgramData"}
+    return re.sub(r"%([^%]+)%", lambda m: env.get(m.group(1).lower(), m.group(0)), path)
+
+
+def windows_to_unix(path, prefix):
+    """Resolve a Windows path to a unix path, matching names case-insensitively like Wine."""
+    m = re.match(r"^([A-Za-z]):[\\/]?(.*)$", path)
+    if not m:
+        return None
+    cur = os.path.realpath(os.path.join(prefix, "dosdevices", m.group(1).lower() + ":"))
+    for part in [p for p in re.split(r"[\\/]+", m.group(2)) if p]:
+        nxt = os.path.join(cur, part)
+        if not os.path.exists(nxt) and os.path.isdir(cur):
+            match = next((e for e in os.listdir(cur) if e.lower() == part.lower()), None)
+            nxt = os.path.join(cur, match or part)
+        cur = nxt
+    return cur
+
+
+def bottle_info(prefix):
+    """Return (bottle name, 'flatpak'|'native') for a Bottles prefix, else (None, None)."""
+    try:
+        with open(os.path.join(prefix, "bottle.yml"), encoding="utf-8") as f:
+            name = next((l.split(":", 1)[1].strip().strip("'\"") for l in f if l.startswith("Name:")), None)
+    except OSError:
+        return None, None
+    if not name:
+        return None, None
+    return name, "flatpak" if os.path.realpath(prefix).startswith(os.path.realpath(FLATPAK_BOTTLES)) else "native"
+
+
+# ---------------------------------------------------------------- desktop entries
+
+def exec_quote(arg):
+    """Quote one argument for a .desktop Exec line (spec: quoting, then % escaping)."""
+    if re.fullmatch(r"[A-Za-z0-9_@%+=:,./-]+", arg):
+        quoted = arg
+    else:
+        quoted = '"' + re.sub(r'(["`$\\])', r"\\\1", arg) + '"'
+    return quoted.replace("%", "%%")
+
+
+def desktop_escape(value):
+    return value.replace("\\", "\\\\").replace("\n", " ")
+
+
+def slug(text):
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "prefix"
+
+
+def current_handler(scheme):
+    try:
+        return subprocess.run(["xdg-mime", "query", "default", "x-scheme-handler/" + scheme],
+                              capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def describe(s, prefix):
+    """Fill in exe/args/status for a scheme entry."""
+    s["problem"] = None
+    if not SCHEME_RE.match(s["scheme"]):
+        s["problem"] = "invalid scheme name (broken installer entry)"
+    elif s["scheme"].lower() in SKIP_SCHEMES:
+        s["problem"] = "handled by Linux"
+    if not s["command"]:
+        s["problem"] = s["problem"] or "no open command"
+        return s
+    exe, args = split_command(expand_env(s["command"], prefix))
+    s["exe_win"], s["args"] = exe, args
+    s["exe"] = windows_to_unix(exe, prefix)
+    if ntpath.basename(exe).lower() in SKIP_EXES:
+        s["problem"] = s["problem"] or "forwarded to the Linux browser by Wine"
+    elif not s["exe"] or not os.path.exists(s["exe"]):
+        s["problem"] = s["problem"] or "program not installed"
+    s["handler"] = current_handler(s["scheme"])
+    return s
+
+
+def desktop_name(prefix, scheme):
+    name, _ = bottle_info(prefix)
+    return f"{DESKTOP_PREFIX}{slug(name or os.path.basename(os.path.normpath(prefix)))}-{slug(scheme)}.desktop"
+
+
+def install_handler(dry_run):
+    if dry_run:
+        print(f"would write {HANDLER}")
+        return
+    os.makedirs(os.path.dirname(HANDLER), exist_ok=True)
+    with open(HANDLER, "w") as f:
+        f.write(HANDLER_SCRIPT)
+    os.chmod(HANDLER, 0o755)
+
+
+def register(s, prefix, wine, dry_run):
+    bottle, kind = bottle_info(prefix)
+    app = os.path.splitext(os.path.basename(s["exe"]))[0]
+    where = f"Bottles: {bottle}" if bottle else f"prefix {prefix}"
+    cmd = [HANDLER]
+    if bottle:
+        cmd += ["--bottle", bottle, "--bottles", kind]
+    elif wine != "wine":
+        cmd += ["--wine", wine]
+    cmd += [prefix, s["exe"]] + s["args"] + ["--"]
+    exec_line = " ".join(exec_quote(a) for a in cmd) + " %u"
+    entry = (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        f"Name={desktop_escape(app)} ({desktop_escape(where)})\n"
+        f"Comment=Passes {desktop_escape(s['scheme'])}:// links to {desktop_escape(app)} in Wine "
+        "(created by wine-url-register)\n"
+        f"Exec={exec_line}\n"
+        f"MimeType=x-scheme-handler/{s['scheme']};\n"
+        "NoDisplay=true\n"
+        "Terminal=false\n"
+    )
+    path = os.path.join(APPS_DIR, desktop_name(prefix, s["scheme"]))
+    if dry_run:
+        print(f"--- would write {path}:\n{entry}--- would run: xdg-mime default "
+              f"{os.path.basename(path)} x-scheme-handler/{s['scheme']}")
+        return
+    os.makedirs(APPS_DIR, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(entry)
+    subprocess.run(["xdg-mime", "default", os.path.basename(path), "x-scheme-handler/" + s["scheme"]], check=False)
+    print(f"registered {s['scheme']}:// -> {app}  ({path})")
+
+
+def unregister(scheme, prefix, dry_run):
+    path = os.path.join(APPS_DIR, desktop_name(prefix, scheme))
+    if not os.path.exists(path):
+        print(f"{scheme}: no entry created by this script ({path})")
+        return False
+    if dry_run:
+        print(f"would remove {path}")
+        return True
+    os.remove(path)
+    print(f"removed {path}")
+    return True
+
+
+def refresh_database(dry_run):
+    if not dry_run and shutil.which("update-desktop-database"):
+        subprocess.run(["update-desktop-database", APPS_DIR], check=False)
+
+
+# ---------------------------------------------------------------- main
+
+def print_table(schemes):
+    print(f"\n  #  {'scheme':<20} {'program':<34} status")
+    for i, s in enumerate(schemes, 1):
+        prog = ntpath.basename(s.get("exe_win") or "") or "-"
+        if s["problem"]:
+            status = "skip: " + s["problem"]
+        elif s["handler"].startswith(DESKTOP_PREFIX):
+            status = "registered by this script"
+        elif s["handler"]:
+            status = "registered: " + s["handler"]
+        else:
+            status = "NOT registered"
+        print(f"{i:>3}  {s['scheme']:<20} {prog:<34} {status}")
+    print()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("prefix", nargs="?", help="Wine prefix (folder containing system.reg and drive_c)")
+    ap.add_argument("--list", action="store_true", help="only list the schemes")
+    ap.add_argument("--add", nargs="+", metavar="SCHEME", help="register these schemes without prompting")
+    ap.add_argument("--remove", nargs="+", metavar="SCHEME", help="remove entries created by this script")
+    ap.add_argument("--wine", default="wine", help="wine binary for non-Bottles prefixes")
+    ap.add_argument("--dry-run", action="store_true", help="show what would be done")
+    opts = ap.parse_args()
+
+    prefix = opts.prefix or input("Wine prefix path: ").strip()
+    prefix = os.path.abspath(os.path.expanduser(prefix.strip("'\"")))
+    if not os.path.isfile(os.path.join(prefix, "system.reg")):
+        sys.exit(f"{prefix} does not look like a Wine prefix (no system.reg)")
+
+    if opts.remove:
+        if any([unregister(s, prefix, opts.dry_run) for s in opts.remove]):
+            refresh_database(opts.dry_run)
+        return
+
+    schemes = [describe(s, prefix) for s in find_schemes(prefix)]
+    bottle, kind = bottle_info(prefix)
+    print(f"Prefix: {prefix}" + (f"\nBottle: {bottle} ({kind} Bottles)" if bottle else ""))
+    if not schemes:
+        sys.exit("No URL schemes are registered in this prefix.")
+    print_table(schemes)
+    if opts.list:
+        return
+
+    usable = [s for s in schemes if not s["problem"]]
+    if opts.add:
+        by_name = {s["scheme"].lower(): s for s in schemes}
+        chosen = []
+        for name in opts.add:
+            s = by_name.get(name.lower())
+            if not s:
+                print(f"{name}: not registered in this prefix")
+            elif s["problem"]:
+                print(f"{name}: skipped ({s['problem']})")
+            else:
+                chosen.append(s)
+    else:
+        if not usable:
+            sys.exit("Nothing to register.")
+        answer = input("Choose numbers to register (e.g. 3 or 2 5), 'a' for all not yet registered, "
+                       "Enter to quit: ").strip().lower()
+        if not answer:
+            return
+        if answer == "a":
+            chosen = [s for s in usable if not s["handler"].startswith(DESKTOP_PREFIX)]
+        else:
+            chosen = []
+            for tok in re.split(r"[\s,]+", answer):
+                if not tok.isdigit() or not 1 <= int(tok) <= len(schemes):
+                    print(f"ignoring '{tok}'")
+                    continue
+                s = schemes[int(tok) - 1]
+                if s["problem"]:
+                    print(f"{s['scheme']}: skipped ({s['problem']})")
+                else:
+                    chosen.append(s)
+
+    if not chosen:
+        return
+    if not bottle and opts.wine == "wine" and not shutil.which("wine"):
+        print("note: 'wine' is not in PATH; links can only reach apps while the prefix is running "
+              "(pass --wine /path/to/wine to fix)")
+    install_handler(opts.dry_run)
+    for s in chosen:
+        if s["handler"] and not s["handler"].startswith(DESKTOP_PREFIX):
+            print(f"{s['scheme']}: replacing previous handler {s['handler']} (its file is left in place)")
+        register(s, prefix, opts.wine, opts.dry_run)
+    refresh_database(opts.dry_run)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        print()
