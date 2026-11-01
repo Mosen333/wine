@@ -499,8 +499,12 @@ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, BOOL fullscreen )
         ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
         if ((ex_style & (WS_EX_LAYERED | WS_EX_TRANSPARENT)) == (WS_EX_LAYERED | WS_EX_TRANSPARENT))
             return FALSE;
-        /* popup with sysmenu == caption are managed */
-        if (style & WS_SYSMENU) return TRUE;
+        /* popup with sysmenu == caption are managed, except tool windows shown
+         * without activation: JUCE's popup menus have WS_SYSMENU too, but are
+         * never activated on Windows; a window manager focuses them as the
+         * pointer crosses them, and JUCE closes a menu once the pointer leaves
+         * it and focus has moved to a window that isn't JUCE's */
+        if ((style & WS_SYSMENU) && !(ex_style & WS_EX_TOOLWINDOW)) return TRUE;
         /* full-screen popup windows are managed */
         if (fullscreen) return TRUE;
     }
