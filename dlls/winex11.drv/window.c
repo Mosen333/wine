@@ -492,6 +492,13 @@ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, BOOL fullscreen )
     if (style & WS_THICKFRAME) return TRUE;
     if (style & WS_POPUP)
     {
+        /* click-through layered popups never get input (empty input shape, see
+         * sync_window_input_shape), so leave them to us: JUCE gives the drop shadows
+         * around its menus WS_SYSMENU, and a window manager that manages them sends
+         * stale sizes that JUCE takes as its host window moving, closing the menu */
+        ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
+        if ((ex_style & (WS_EX_LAYERED | WS_EX_TRANSPARENT)) == (WS_EX_LAYERED | WS_EX_TRANSPARENT))
+            return FALSE;
         /* popup with sysmenu == caption are managed */
         if (style & WS_SYSMENU) return TRUE;
         /* full-screen popup windows are managed */
