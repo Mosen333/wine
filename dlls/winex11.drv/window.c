@@ -483,6 +483,17 @@ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, BOOL fullscreen )
     /* child windows are not managed */
     style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
     if ((style & (WS_CHILD|WS_POPUP)) == WS_CHILD) return FALSE;
+    /* Windows with an empty rect are never drawn on Windows, so leave them to us,
+     * also when they get activated. Delphi's TApplication window (FL Studio) is
+     * such a visible 0x0 window; Hyprland gives a managed window that small its
+     * default floating size, we take that over as the win32 size, and the window
+     * shows up black (800x800) in front of the application. Unmanaged it stays
+     * 0x0 with an empty shape (see sync_empty_window_shape). */
+    {
+        RECT rect;
+        if (NtUserGetWindowRect( hwnd, &rect, NtUserGetDpiForWindow( hwnd ) ) && IsRectEmpty( &rect ))
+            return FALSE;
+    }
     /* activated windows are managed */
     if (!(swp_flags & (SWP_NOACTIVATE|SWP_HIDEWINDOW))) return TRUE;
     if (hwnd == get_active_window()) return TRUE;
