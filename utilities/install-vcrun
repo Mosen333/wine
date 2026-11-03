@@ -9,8 +9,9 @@ This downloads Microsoft's current vc_redist x64/x86, extracts the DLLs directly
 into the prefix, sets the overrides to native,builtin and verifies the result.
 
 Usage:
-  install-vcrun BOTTLE            install into a Bottles bottle (name or folder) or Wine prefix
-  install-vcrun BOTTLE --check    only show which runtime the prefix has
+  python3 install-vcrun BOTTLE            install into a Bottles bottle (name or folder) or Wine prefix
+  python3 install-vcrun BOTTLE --check    only show which runtime the prefix has
+  python3 install-vcrun /path/to/wineprefix --wine /path/to/wine/binary         for a bare wineprefix
 Options: --wine PATH  wine binary to use (default: the bottle's runner, else wine in PATH)
 Close the bottle (FL Studio etc.) first.
 """
@@ -26,16 +27,31 @@ import subprocess
 import sys
 import tempfile
 
-BOTTLES_DIRS = [os.path.expanduser("~/.var/app/com.usebottles.bottles/data/bottles"),
-                os.path.expanduser("~/.local/share/bottles")]
-URLS = {"x64": "https://aka.ms/vs/17/release/vc_redist.x64.exe",
-        "x86": "https://aka.ms/vs/17/release/vc_redist.x86.exe"}
+BOTTLES_DIRS = [
+    os.path.expanduser("~/.var/app/com.usebottles.bottles/data/bottles"),
+    os.path.expanduser("~/.local/share/bottles"),
+]
+URLS = {
+    "x64": "https://aka.ms/vs/17/release/vc_redist.x64.exe",
+    "x86": "https://aka.ms/vs/17/release/vc_redist.x86.exe",
+}
 # DLLs taken from the redistributable (vcruntime140_1 only exists for x64)
-DLLS = ["concrt140", "msvcp140", "msvcp140_1", "msvcp140_2", "msvcp140_atomic_wait",
-        "msvcp140_codecvt_ids", "vcamp140", "vccorlib140", "vcomp140", "vcruntime140",
-        "vcruntime140_1", "vcruntime140_threads"]
+DLLS = [
+    "concrt140",
+    "msvcp140",
+    "msvcp140_1",
+    "msvcp140_2",
+    "msvcp140_atomic_wait",
+    "msvcp140_codecvt_ids",
+    "vcamp140",
+    "vccorlib140",
+    "vcomp140",
+    "vcruntime140",
+    "vcruntime140_1",
+    "vcruntime140_threads",
+]
 SUFFIX = {"x64": "_amd64", "x86": "_x86"}
-MACHINE = {"x64": 0x8664, "x86": 0x14c}
+MACHINE = {"x64": 0x8664, "x86": 0x14C}
 
 
 def die(msg):
@@ -43,6 +59,7 @@ def die(msg):
 
 
 # ------------------------------------------------------------------ prefix / runner
+
 
 def resolve_prefix(arg):
     if os.path.isfile(os.path.join(arg, "system.reg")):
@@ -70,11 +87,15 @@ def find_wine(prefix, override):
         return override
     try:
         with open(os.path.join(prefix, "bottle.yml"), encoding="utf-8") as f:
-            runner = next((l.split(":", 1)[1].strip() for l in f if l.startswith("Runner:")), "")
+            runner = next(
+                (l.split(":", 1)[1].strip() for l in f if l.startswith("Runner:")), ""
+            )
     except OSError:
         runner = ""
     if runner:
-        wine = os.path.join(os.path.dirname(os.path.dirname(prefix)), "runners", runner, "bin", "wine")
+        wine = os.path.join(
+            os.path.dirname(os.path.dirname(prefix)), "runners", runner, "bin", "wine"
+        )
         if os.path.isfile(wine):
             return wine
     wine = shutil.which("wine")
@@ -91,8 +112,9 @@ def prefix_running(prefix):
         if not pid.isdigit():
             continue
         try:
-            if os.path.basename(os.readlink(f"/proc/{pid}/exe")) == "wineserver" and \
-                    os.readlink(f"/proc/{pid}/cwd").endswith("/" + key):
+            if os.path.basename(
+                os.readlink(f"/proc/{pid}/exe")
+            ) == "wineserver" and os.readlink(f"/proc/{pid}/cwd").endswith("/" + key):
                 return True
         except OSError:
             pass
@@ -100,6 +122,7 @@ def prefix_running(prefix):
 
 
 # ------------------------------------------------------------------ PE inspection
+
 
 def pe_info(path):
     """(machine, file version, is_wine) of a PE file, or None."""
@@ -110,16 +133,19 @@ def pe_info(path):
     if data[:2] != b"MZ":
         return None
     pe = struct.unpack_from("<I", data, 0x3C)[0]
-    if data[pe:pe + 4] != b"PE\0\0":
+    if data[pe : pe + 4] != b"PE\0\0":
         return None
     machine = struct.unpack_from("<H", data, pe + 4)[0]
-    is_wine = b"Wine builtin DLL" in data[0x40:pe] or b"Wine placeholder DLL" in data[0x40:pe] \
+    is_wine = (
+        b"Wine builtin DLL" in data[0x40:pe]
+        or b"Wine placeholder DLL" in data[0x40:pe]
         or "Wine runtime library".encode("utf-16-le") in data
+    )
     i = data.find(b"\xbd\x04\xef\xfe")  # VS_FIXEDFILEINFO signature
     version = "?"
     if i > 0:
         ms, ls = struct.unpack_from("<II", data, i + 8)
-        version = f"{ms >> 16}.{ms & 0xffff}.{ls >> 16}.{ls & 0xffff}"
+        version = f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}"
     return machine, version, is_wine
 
 
@@ -130,25 +156,37 @@ def describe(path):
     if not info:
         return "not a DLL?"
     machine, version, is_wine = info
-    arch = {0x8664: "x64", 0x14c: "x86", 0xaa64: "arm64"}.get(machine, hex(machine))
+    arch = {0x8664: "x64", 0x14C: "x86", 0xAA64: "arm64"}.get(machine, hex(machine))
     return f"{'WINE (builtin)' if is_wine else 'Microsoft':15} {version:16} {arch:5} {os.path.getsize(path):>8} bytes"
 
 
 # ------------------------------------------------------------------ registry
 
+
 def run_wine(wine, prefix, *args):
-    env = dict(os.environ, WINEPREFIX=prefix, WINEDEBUG="-all", WINEDLLOVERRIDES="mscoree,mshtml=")
-    return subprocess.run([wine, *args], env=env, capture_output=True, text=True, errors="replace")
+    env = dict(
+        os.environ,
+        WINEPREFIX=prefix,
+        WINEDEBUG="-all",
+        WINEDLLOVERRIDES="mscoree,mshtml=",
+    )
+    return subprocess.run(
+        [wine, *args], env=env, capture_output=True, text=True, errors="replace"
+    )
 
 
 def read_overrides(prefix):
     """DLL overrides from user.reg (lowercase name -> value)."""
     out, inside = {}, False
     try:
-        with open(os.path.join(prefix, "user.reg"), encoding="utf-8", errors="replace") as f:
+        with open(
+            os.path.join(prefix, "user.reg"), encoding="utf-8", errors="replace"
+        ) as f:
             for line in f:
                 if line.startswith("["):
-                    inside = line.lower().startswith("[software\\\\wine\\\\dlloverrides]")
+                    inside = line.lower().startswith(
+                        "[software\\\\wine\\\\dlloverrides]"
+                    )
                 elif inside:
                     m = re.match(r'"([^"]+)"="([^"]*)"', line)
                     if m:
@@ -162,17 +200,23 @@ def bottles_overrides(prefix):
     """Overrides Bottles passes via WINEDLLOVERRIDES at launch (bottle.yml); they beat the registry."""
     found = []
     try:
-        lines = open(os.path.join(prefix, "bottle.yml"), encoding="utf-8").read().splitlines()
+        lines = (
+            open(os.path.join(prefix, "bottle.yml"), encoding="utf-8")
+            .read()
+            .splitlines()
+        )
     except OSError:
         return found
     for i, line in enumerate(lines):
         if line.startswith("DLL_Overrides:"):
-            for sub in lines[i + 1:]:
+            for sub in lines[i + 1 :]:
                 if not sub.startswith(" "):
                     break
                 key, _, val = sub.strip().partition(":")
                 if key.strip().lower() in DLLS:
-                    found.append(f"bottle.yml DLL_Overrides: {key.strip()}: {val.strip()}")
+                    found.append(
+                        f"bottle.yml DLL_Overrides: {key.strip()}: {val.strip()}"
+                    )
         if "WINEDLLOVERRIDES" in line and any(d in line.lower() for d in DLLS):
             found.append(f"bottle.yml environment: {line.strip()}")
     return found
@@ -180,10 +224,14 @@ def bottles_overrides(prefix):
 
 # ------------------------------------------------------------------ main steps
 
+
 def dll_dirs(prefix):
     win = os.path.join(prefix, "drive_c", "windows")
     if os.path.isdir(os.path.join(win, "syswow64")):
-        return {"x64": os.path.join(win, "system32"), "x86": os.path.join(win, "syswow64")}
+        return {
+            "x64": os.path.join(win, "system32"),
+            "x86": os.path.join(win, "syswow64"),
+        }
     return {"x86": os.path.join(win, "system32")}  # 32-bit prefix
 
 
@@ -198,8 +246,13 @@ def check(prefix):
                 continue
             desc = describe(os.path.join(d, name + ".dll"))
             print(f"  {name + '.dll':28} {desc}")
-            if name in ("msvcp140", "vcruntime140", "concrt140", "msvcp140_1", "msvcp140_2") and \
-                    not desc.startswith("Microsoft"):
+            if name in (
+                "msvcp140",
+                "vcruntime140",
+                "concrt140",
+                "msvcp140_1",
+                "msvcp140_2",
+            ) and not desc.startswith("Microsoft"):
                 ok = False
     print("\nDLL overrides:")
     for name in DLLS:
@@ -210,12 +263,18 @@ def check(prefix):
     conflicts = bottles_overrides(prefix)
     if conflicts:
         ok = False
-        print("\nBottles overrides these at launch (they win over the registry); remove them in")
+        print(
+            "\nBottles overrides these at launch (they win over the registry); remove them in"
+        )
         print("Bottles -> the bottle -> Settings -> Legacy Wine Tools / DLL overrides:")
         for c in conflicts:
             print("  " + c)
-    print("\nResult:", "OK, Microsoft's runtime is installed and preferred" if ok
-          else "NOT OK, programs will get Wine's own msvcp140 (run without --check to fix)")
+    print(
+        "\nResult:",
+        "OK, Microsoft's runtime is installed and preferred"
+        if ok
+        else "NOT OK, programs will get Wine's own msvcp140 (run without --check to fix)",
+    )
     return ok
 
 
@@ -234,25 +293,41 @@ def download_and_extract(work):
         os.makedirs(out)
         # extract every cabinet: the container numbering changes between releases
         for cab in sorted(os.listdir(bundle)):
-            subprocess.run(["cabextract", "-q", "-d", out, "-F", "*.dll" + SUFFIX[arch],
-                            os.path.join(bundle, cab)], capture_output=True)
+            subprocess.run(
+                [
+                    "cabextract",
+                    "-q",
+                    "-d",
+                    out,
+                    "-F",
+                    "*.dll" + SUFFIX[arch],
+                    os.path.join(bundle, cab),
+                ],
+                capture_output=True,
+            )
         for name in DLLS:
             path = os.path.join(out, name + ".dll" + SUFFIX[arch])
             info = pe_info(path)
             if info and info[0] == MACHINE[arch] and not info[2]:
                 found[(arch, name)] = (path, info[1])
         if (arch, "msvcp140") not in found:
-            die(f"msvcp140.dll ({arch}) not found in Microsoft's download: the package layout changed?")
+            die(
+                f"msvcp140.dll ({arch}) not found in Microsoft's download: the package layout changed?"
+            )
     return found
 
 
 def install(prefix, wine):
     if prefix_running(prefix):
-        die("this bottle is running: close FL Studio / programs in the bottle first (or 'wineserver -k')")
+        die(
+            "this bottle is running: close FL Studio / programs in the bottle first (or 'wineserver -k')"
+        )
     dirs = dll_dirs(prefix)
     with tempfile.TemporaryDirectory(prefix="vcrun-") as work:
         found = download_and_extract(work)
-        backup = os.path.join(prefix, "vcrun-backup-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+        backup = os.path.join(
+            prefix, "vcrun-backup-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        )
         for (arch, name), (src, version) in sorted(found.items()):
             if arch not in dirs:
                 continue
@@ -267,21 +342,37 @@ def install(prefix, wine):
 
     print("setting DLL overrides to native,builtin")
     for name in DLLS:
-        r = run_wine(wine, prefix, "reg", "add", r"HKCU\Software\Wine\DllOverrides", "/v", name,
-                     "/t", "REG_SZ", "/d", "native,builtin", "/f")
+        r = run_wine(
+            wine,
+            prefix,
+            "reg",
+            "add",
+            r"HKCU\Software\Wine\DllOverrides",
+            "/v",
+            name,
+            "/t",
+            "REG_SZ",
+            "/d",
+            "native,builtin",
+            "/f",
+        )
         if r.returncode != 0:
             die(f"setting the override for {name} failed:\n{r.stdout}{r.stderr}")
     # wait until the wineserver has written the registry back to user.reg
     wineserver = os.path.join(os.path.dirname(wine), "wineserver")
     if not os.path.isfile(wineserver):
         wineserver = shutil.which("wineserver") or "wineserver"
-    subprocess.run([wineserver, "-w"], env=dict(os.environ, WINEPREFIX=prefix), capture_output=True)
+    subprocess.run(
+        [wineserver, "-w"], env=dict(os.environ, WINEPREFIX=prefix), capture_output=True
+    )
     print()
     return check(prefix)
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("bottle", help="Bottles bottle name or folder, or Wine prefix")
     ap.add_argument("--check", action="store_true", help="only report, change nothing")
     ap.add_argument("--wine", help="wine binary (default: the bottle's runner)")
