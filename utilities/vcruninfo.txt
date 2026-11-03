@@ -4,14 +4,8 @@ If you encounter any problems with plugins (mainly kontakt) not being able to
 load in any instrument and subsequently crashing, it may be that a vcredist version
 got overridden by a plugin installer or due to a mistake when setting up the prefix/
 bottle for use in music production. When that happens, you can try to override the
-bad vcredist/vcrun dlls with winetricks; try:
+bad vcredist/vcrun dlls with the helper script in this directory. You can inspect the
+script and see how it is used.
 
-BOTTLE=~/.var/app/com.usebottles.bottles/data/bottles/bottles/<yourbottle>
-RUNNER=~/.var/app/com.usebottles.bottles/data/bottles/runners/<yourrunner>
-WINEPREFIX="$BOTTLE" WINE="$RUNNER/bin/wine" WINESERVER="$RUNNER/bin/wineserver" \
-    winetricks -q vcrun2022
 
-or, if you manually manage a wineprefix, run
-
-WINEPREFIX="/path/to/prefix" WINE="/path/to/wine" WINESERVER="path/to/wine" \
-    winetricks -q vcrun2022
+##############################################################################
