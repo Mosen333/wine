@@ -145,6 +145,7 @@ struct user_thread_info
     struct list                   known_pointers;         /* list of known pointers */
     UINT                          paint_depth;            /* WM_NCPAINT / WM_ERASEBKGND sends in progress */
     UINT                          swp_depth;              /* set_window_pos() calls and DeferWindowPos batches in progress */
+    BOOL                          cursor_removed;         /* last SetCursor of this thread was NULL */
 };
 
 extern struct user_thread_info *get_user_thread_info(void);
