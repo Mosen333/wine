@@ -1466,8 +1466,15 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
     /* Only use dialog type for owned popups. Metacity allows making fullscreen
      * only normal windows, and doesn't handle correctly TRANSIENT_FOR hint for
      * dialogs owned by fullscreen windows.
+     *
+     * Hyprland gives keyboard focus to an override-redirect window under the pointer unless
+     * its type says it doesn't want focus.  When such a window closes while a button is held
+     * (FL Studio drags an entry out of its menu), the focus change re-enters the pointer and
+     * XWayland releases the button, ending the drag.
      */
-    if (((style & WS_POPUP) || (ex_style & WS_EX_DLGMODALFRAME)) && owner)
+    if ((style & WS_POPUP) && !(style & WS_CAPTION) && !data->managed)
+        window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_DROPDOWN_MENU );
+    else if (((style & WS_POPUP) || (ex_style & WS_EX_DLGMODALFRAME)) && owner)
         window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_DIALOG );
     else if ((style & WS_POPUP) && (ex_style & WS_EX_TOOLWINDOW) && !owner
             && !(style & WS_CAPTION))
