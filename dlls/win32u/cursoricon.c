@@ -85,12 +85,15 @@ static HCURSOR get_foreign_cursor( HCURSOR foreign );
 BOOL process_wine_setcursor( HWND hwnd, HWND window, HCURSOR handle )
 {
     TRACE( "hwnd %p, window %p, hcursor %p\n", hwnd, window, handle );
-    if (!handle)
+    if (!handle && !get_user_thread_info()->cursor_removed)
     {
         /* Native Windows shows the class cursor, then the system arrow, for a
          * window whose cursor is not set — never the empty/transparent cursor
-         * that hides the pointer. Only ShowCursor(FALSE) (count < 0) should
-         * hide it; CURSOR_SHOWING is clear in that case. */
+         * that hides the pointer. Only ShowCursor(FALSE) (count < 0) and an
+         * application's own SetCursor(NULL) should hide it; CURSOR_SHOWING is
+         * clear in the first case, cursor_removed is set in the second.
+         * MeldaProduction knobs do the latter, and Xwayland only carries out
+         * their pointer warps while the cursor is hidden. */
         CURSORINFO info;
         info.cbSize = sizeof(info);
         if (NtUserGetCursorInfo( &info ) && (info.flags & CURSOR_SHOWING))
@@ -155,6 +158,7 @@ HCURSOR WINAPI NtUserSetCursor( HCURSOR cursor )
      * must happen before the server request, as the receiving thread may process
      * the resulting WM_WINE_SETCURSOR before this call returns */
     if (cursor) publish_cursor( cursor );
+    get_user_thread_info()->cursor_removed = !cursor;
 
     SERVER_START_REQ( set_cursor )
     {
