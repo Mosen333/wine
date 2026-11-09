@@ -1,0 +1,66 @@
+-- Consider using some or all of these if FL-studio begins to show weird UI
+-- interactions, like drag and drop not working and or unwanted focusing.
+
+
+-- FL Studio under Wine (XWayland, class fl64.exe). Tiling/resizing of the main
+-- window needs the local Wine option ResizeUnframedWindows=Y for FL64.exe.
+-- JUCE menu drop shadows are kept away from the window manager by the local
+-- Wine fix "winex11: Don't manage click-through layered popups".
+
+-- Main window draws its own title bar; when it covers the monitor Wine flags it
+-- fullscreen. Ignore those requests (un-maximize FL in its own title bar).
+hl.window_rule({
+	name = "fl-studio-main",
+	match = { class = "^fl64\\.exe$", initial_title = "^FL Studio" },
+	suppress_event = "fullscreen maximize",
+})
+
+-- FL's own popup menus (TQuickPopupMenuWindow) are untitled. Don't hand focus
+-- to each new submenu as it maps, so the pointer can go back to the previous
+-- menu level; their own activation requests still go through.
+hl.window_rule({
+	name = "fl-studio-popups",
+	match = { class = "^fl64\\.exe$", title = "^$", float = true },
+	no_initial_focus = true,
+	suppress_event = "activate",
+})
+
+-- Plugin (JUCE) popup menus need no rule: the local Wine fix "winex11: Don't
+-- manage tool-window popups with a system menu that aren't activated" keeps
+-- them unmanaged, so they never take the focus. (A no_focus rule here would
+-- also block pointer input where a menu reaches outside FL's window.)
+
+-- FL's black helper window (Delphi's 0x0 TApplication window) needs no rule:
+-- the local Wine fix "winex11: Don't manage windows with an empty rect" keeps
+-- it unmanaged, so Hyprland never gives it a size.
+
+-- The main window is matched by its initial title: with a project loaded the
+-- title becomes "<project>.flp - FL Studio 2026".
+hl.on("window.open", function(w)
+	if w.class == "fl64.exe" and w.initial_title:match("^FL Studio") then
+		hl.dispatch(hl.dsp.window.fullscreen_state({ internal = 0, client = 0, window = "address:" .. w.address }))
+	end
+end)
+
+-- FL's plugin picker (F8). Closing it while it has keyboard focus makes XWayland
+-- release a held mouse button, which drops a plugin being dragged out of it. It
+-- also covers the monitor, so keep it from competing with FL for full screen.
+hl.window_rule({
+	name = "fl-studio-picker",
+	match = { class = "^fl64\\.exe$", title = "^PlugList$" },
+	no_focus = true,
+	suppress_event = "fullscreen maximize activate",
+})
+
+-- Wine's fallback system tray (explorer.exe's Shell_TrayWnd) holds the tray
+-- icons of Windows apps (Splice, Native Access, Epic, ...). Wine only speaks the
+-- X11 tray protocol, which Omarchy's bar doesn't offer, so it shows up as a
+-- small untitled window. Keep it on a special workspace; SUPER+ALT+T shows it
+-- (bindings.lua) when a tray menu is needed.
+hl.window_rule({
+	name = "wine-systray",
+	match = { class = "^explorer\\.exe$", title = "^$", float = true },
+	workspace = "special:wine-tray silent",
+	no_initial_focus = true,
+})
+
