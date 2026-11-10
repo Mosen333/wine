@@ -608,9 +608,20 @@ void cancel_capture_for_wm_change( HWND hwnd )
     NTSTATUS status;
     UINT i;
 
+    HWND owner;
+
     info.cbSize = sizeof(info);
     if (!NtUserGetGUIThreadInfo( GetCurrentThreadId(), &info ) || !info.hwndCapture) return;
     if (info.flags & (GUI_INMENUMODE | GUI_INMOVESIZE)) return;
+
+    /* Only a change to the capture window or to a window it belongs to (an owner, e.g. the window
+     * a drop-down list opened from) stands for such a press.  A tiling window manager also resizes
+     * other windows on its own, as layouts change; an ownerless context menu that captured the
+     * mouse (Electron's, e.g. Splice's tray menu) was closed by such a resize of the application's
+     * main window as soon as it opened. */
+    for (owner = NtUserGetAncestor( info.hwndCapture, GA_ROOT ); owner; owner = NtUserGetWindowRelative( owner, GW_OWNER ))
+        if (owner == hwnd) break;
+    if (!owner) return;
 
     while ((status = get_shared_desktop( &lock, &desktop_shm )) == STATUS_PENDING)
         for (i = 0; i < ARRAY_SIZE(buttons); i++) keystate[i] = desktop_shm->keystate[buttons[i]];
