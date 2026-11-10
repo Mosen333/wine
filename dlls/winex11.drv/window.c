@@ -506,6 +506,18 @@ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, BOOL fullscreen )
         if (NtUserGetWindowRect( hwnd, &rect, NtUserGetDpiForWindow( hwnd ) ) && IsRectEmpty( &rect ))
             return FALSE;
     }
+    /* Ownerless borderless always-on-top tool popups are context menus (Electron/Chromium,
+     * e.g. Splice's tray menu): leave them to us even when activated.  They are shown without
+     * activation first and activated right after; making a mapped window managed recreates its
+     * X window, and in that gap the window manager focuses another window, which deactivates
+     * the menu and closes it within a fraction of a second. */
+    if ((style & WS_POPUP) && !(style & (WS_CAPTION | WS_THICKFRAME)))
+    {
+        DWORD ex = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
+        if ((ex & (WS_EX_TOOLWINDOW | WS_EX_TOPMOST)) == (WS_EX_TOOLWINDOW | WS_EX_TOPMOST) &&
+            !(ex & WS_EX_APPWINDOW) && !NtUserGetWindowRelative( hwnd, GW_OWNER ))
+            return FALSE;
+    }
     /* activated windows are managed */
     if (!(swp_flags & (SWP_NOACTIVATE|SWP_HIDEWINDOW))) return TRUE;
     if (hwnd == get_active_window()) return TRUE;
