@@ -1796,6 +1796,28 @@ BOOL X11DRV_EnterNotify( HWND hwnd, XEvent *xev )
  * is no longer in this one, so it must not claim the point the way
  * send_mouse_input() does for the z-order.
  */
+/* Whether Xwayland still has the pointer on the top-level window that contains this one (or on no
+ * window at all).  A tiling window manager can give a window less room than its minimum size and
+ * clip it: the pointer then really leaves through a point inside the X window, onto the window next
+ * to it, and Xwayland already has it there.  Only a pointer the X server no longer sees, on a
+ * decoration the compositor draws, is still reported on the window it left. */
+static BOOL pointer_still_on_window( Display *display, Window window )
+{
+    Window root, parent, child, *children, top = window;
+    int root_x, root_y, win_x, win_y;
+    unsigned int state, count;
+
+    if (!XQueryPointer( display, root_window, &root, &child, &root_x, &root_y, &win_x, &win_y, &state )) return TRUE;
+    if (!child) return TRUE;
+    while (XQueryTree( display, top, &root, &parent, &children, &count ))
+    {
+        if (children) XFree( children );
+        if (!parent || parent == root) break;
+        top = parent;
+    }
+    return child == top;
+}
+
 BOOL X11DRV_LeaveNotify( HWND hwnd, XEvent *xev )
 {
     struct x11drv_thread_data *thread_data = x11drv_thread_data();
@@ -1831,7 +1853,8 @@ BOOL X11DRV_LeaveNotify( HWND hwnd, XEvent *xev )
      * otherwise, so put the pointer just outside the edge it left through, and keep it there
      * relative to the window while the window manager moves it (X11DRV_GetWindowStateUpdates). */
     if (event->mode == NotifyNormal && (event->detail == NotifyAncestor || event->detail == NotifyVirtual) &&
-        is_xwayland() && (data = get_win_data( hwnd )))
+        is_xwayland() && pointer_still_on_window( event->display, event->window ) &&
+        (data = get_win_data( hwnd )))
     {
         int x = event->x, y = event->y, w = data->rects.visible.right - data->rects.visible.left,
             h = data->rects.visible.bottom - data->rects.visible.top;
