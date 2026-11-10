@@ -230,6 +230,10 @@ static const struct fallback_description
     const WCHAR *families;
     const WCHAR *locale;
 }
+/* The CJK entries also name the families that CJK font packages for Wine prefixes install (Source Han
+ * Sans, from Bottles' cjkfonts) and the Windows CJK UI fonts, for prefixes without Noto Sans CJK: with
+ * only the Noto names, Japanese and Chinese text fell back to no font at all and showed boxes, e.g. in
+ * FL Studio's browser.  Families that aren't installed, or don't have the character, are skipped. */
 system_fallback_config[] =
 {
     /* Latin, Combining Diacritical Marks */
@@ -284,7 +288,7 @@ system_fallback_config[] =
     { "1100-11FF, 3130-318F, "
       "3200-321F, 3260-327F, "
       "A960-A97F, AC00-D7FF, "
-      "D7B0-D7FF",              L"Noto Sans CJK KR" },
+      "D7B0-D7FF",              L"Noto Sans CJK KR, Source Han Sans K, Malgun Gothic, Gulim" },
 
     { "1680-169F",              L"Noto Sans Ogham" },
 
@@ -335,27 +339,27 @@ system_fallback_config[] =
 
     /* CJK Radicals Supplement - 2E80-2EFF */
 
-    { "2E80-2EFF",              L"Noto Sans CJK SC", L"zh-Hans" },
-    { "2E80-2EFF",              L"Noto Sans CJK TC", L"zh-Hant" },
-    { "2E80-2EFF",              L"Noto Sans CJK KR", L"ko" },
+    { "2E80-2EFF",              L"Noto Sans CJK SC, Source Han Sans SC, Microsoft YaHei UI, SimSun", L"zh-Hans" },
+    { "2E80-2EFF",              L"Noto Sans CJK TC, Source Han Sans TC, Microsoft JhengHei UI, PMingLiU", L"zh-Hant" },
+    { "2E80-2EFF",              L"Noto Sans CJK KR, Source Han Sans K, Malgun Gothic, Gulim", L"ko" },
 
     /* CJK Symbols and Punctuation - 3000-303F
        Hiragana                    - 3040-309F
        Katakana                    - 30A0-30FF
        Katakana Phonetic Ext.      - 31F0-31FF */
 
-    { "3000-30FF, 31F0-31FF",   L"Noto Sans CJK SC", L"zh-Hans" },
-    { "3000-30FF, 31F0-31FF",   L"Noto Sans CJK TC", L"zh-Hant" },
-    { "3000-30FF, 31F0-31FF",   L"Noto Sans CJK KR", L"ko" },
-    { "3000-30FF, 31F0-31FF",   L"Noto Sans CJK JP" },
+    { "3000-30FF, 31F0-31FF",   L"Noto Sans CJK SC, Source Han Sans SC, Microsoft YaHei UI, SimSun", L"zh-Hans" },
+    { "3000-30FF, 31F0-31FF",   L"Noto Sans CJK TC, Source Han Sans TC, Microsoft JhengHei UI, PMingLiU", L"zh-Hant" },
+    { "3000-30FF, 31F0-31FF",   L"Noto Sans CJK KR, Source Han Sans K, Malgun Gothic, Gulim", L"ko" },
+    { "3000-30FF, 31F0-31FF",   L"Noto Sans CJK JP, Source Han Sans, Yu Gothic UI, MS UI Gothic, Meiryo UI" },
 
     /* CJK Unified Ext A - 3400-4DBF
        CJK Unified       - 4E00-9FFF */
 
-    { "3400-4DBF, 4E00-9FFF",   L"Noto Sans CJK SC", L"zh-Hans" },
-    { "3400-4DBF, 4E00-9FFF",   L"Noto Sans CJK TC", L"zh-Hant" },
-    { "3400-4DBF, 4E00-9FFF",   L"Noto Sans CJK KR", L"ko" },
-    { "3400-4DBF, 4E00-9FFF",   L"Noto Sans CJK JP" },
+    { "3400-4DBF, 4E00-9FFF",   L"Noto Sans CJK SC, Source Han Sans SC, Microsoft YaHei UI, SimSun", L"zh-Hans" },
+    { "3400-4DBF, 4E00-9FFF",   L"Noto Sans CJK TC, Source Han Sans TC, Microsoft JhengHei UI, PMingLiU", L"zh-Hant" },
+    { "3400-4DBF, 4E00-9FFF",   L"Noto Sans CJK KR, Source Han Sans K, Malgun Gothic, Gulim", L"ko" },
+    { "3400-4DBF, 4E00-9FFF",   L"Noto Sans CJK JP, Source Han Sans, Yu Gothic UI, MS UI Gothic, Meiryo UI" },
 
     { "A000-A4CF",              L"Noto Sans Yi" },
     { "A4D0-A4FF",              L"Noto Sans Lisu" },
@@ -371,30 +375,30 @@ system_fallback_config[] =
 
     /* CJK Compatibility Ideographs - F900-FAFF */
 
-    { "F900-FAFF",              L"Noto Sans CJK SC", L"zh-Hans" },
-    { "F900-FAFF",              L"Noto Sans CJK TC", L"zh-Hant" },
-    { "F900-FAFF",              L"Noto Sans CJK KR", L"ko" },
-    { "F900-FAFF",              L"Noto Sans CJK JP" },
+    { "F900-FAFF",              L"Noto Sans CJK SC, Source Han Sans SC, Microsoft YaHei UI, SimSun", L"zh-Hans" },
+    { "F900-FAFF",              L"Noto Sans CJK TC, Source Han Sans TC, Microsoft JhengHei UI, PMingLiU", L"zh-Hant" },
+    { "F900-FAFF",              L"Noto Sans CJK KR, Source Han Sans K, Malgun Gothic, Gulim", L"ko" },
+    { "F900-FAFF",              L"Noto Sans CJK JP, Source Han Sans, Yu Gothic UI, MS UI Gothic, Meiryo UI" },
 
     /* Vertical Forms - FE10-FE1F */
 
-    { "FE10-FE1F",              L"Noto Sans CJK SC", L"zh-Hans" },
-    { "FE10-FE1F",              L"Noto Sans CJK KR", L"ko" },
-    { "FE10-FE1F",              L"Noto Sans CJK TC" },
+    { "FE10-FE1F",              L"Noto Sans CJK SC, Source Han Sans SC, Microsoft YaHei UI, SimSun", L"zh-Hans" },
+    { "FE10-FE1F",              L"Noto Sans CJK KR, Source Han Sans K, Malgun Gothic, Gulim", L"ko" },
+    { "FE10-FE1F",              L"Noto Sans CJK TC, Source Han Sans TC, Microsoft JhengHei UI, PMingLiU" },
 
     /* CJK Compatibility Forms - FE30-FE4F
        Small Form Variants     - FE50-FE6F */
 
-    { "FE30-FE6F",              L"Noto Sans CJK SC", L"zh-Hans" },
-    { "FE30-FE6F",              L"Noto Sans CJK KR", L"ko" },
-    { "FE30-FE6F",              L"Noto Sans CJK JP", L"ja" },
-    { "FE30-FE6F",              L"Noto Sans CJK TC" },
+    { "FE30-FE6F",              L"Noto Sans CJK SC, Source Han Sans SC, Microsoft YaHei UI, SimSun", L"zh-Hans" },
+    { "FE30-FE6F",              L"Noto Sans CJK KR, Source Han Sans K, Malgun Gothic, Gulim", L"ko" },
+    { "FE30-FE6F",              L"Noto Sans CJK JP, Source Han Sans, Yu Gothic UI, MS UI Gothic, Meiryo UI", L"ja" },
+    { "FE30-FE6F",              L"Noto Sans CJK TC, Source Han Sans TC, Microsoft JhengHei UI, PMingLiU" },
 
     /* Halfwidth and Fullwidth Forms */
-    { "FF00-FFEF",              L"Noto Sans CJK SC", L"zh-Hans" },
-    { "FF00-FFEF",              L"Noto Sans CJK TC", L"zh-Hant" },
-    { "FF00-FFEF",              L"Noto Sans CJK KR", L"ko" },
-    { "FF00-FFEF",              L"Noto Sans CJK JP" },
+    { "FF00-FFEF",              L"Noto Sans CJK SC, Source Han Sans SC, Microsoft YaHei UI, SimSun", L"zh-Hans" },
+    { "FF00-FFEF",              L"Noto Sans CJK TC, Source Han Sans TC, Microsoft JhengHei UI, PMingLiU", L"zh-Hant" },
+    { "FF00-FFEF",              L"Noto Sans CJK KR, Source Han Sans K, Malgun Gothic, Gulim", L"ko" },
+    { "FF00-FFEF",              L"Noto Sans CJK JP, Source Han Sans, Yu Gothic UI, MS UI Gothic, Meiryo UI" },
 
     { "1F800-1F8FF",            L"Noto Sans Symbols2, Noto Sans Symbols 2" },
 };
@@ -3115,7 +3119,7 @@ static BOOL WINAPI dwrite_system_fallback_initonce(INIT_ONCE *once, void *param,
     unsigned int range_count, families_count;
     IDWriteFactory7 *factory = param;
     DWRITE_UNICODE_RANGE ranges[16];
-    WCHAR *families[4], *str;
+    WCHAR *families[8], *str;
     HRESULT hr;
     size_t i;
 
