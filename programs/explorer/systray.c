@@ -472,6 +472,14 @@ static BOOL notify_owner( struct icon *icon, UINT msg, LPARAM lparam )
         lp = MAKELPARAM( msg, icon->id );
     }
 
+    /* The shell lets the owner of a clicked icon take the foreground (AllowSetForegroundWindow, a
+     * stub in Wine), so that it can activate the menu or window it opens.  Without that, once
+     * another process has had input more recently, the owner's SetForegroundWindow is refused and
+     * apps that check it (Electron's tray, e.g. Splice) show no menu from the second click on.
+     * We have just been clicked, so we may hand the foreground on. */
+    if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN)
+        SetForegroundWindow( icon->owner );
+
     TRACE( "relaying 0x%x\n", msg );
     if (!SendNotifyMessageW( icon->owner, icon->callback_message, wp, lp ) &&
         (GetLastError() == ERROR_INVALID_WINDOW_HANDLE))
