@@ -1,0 +1,598 @@
+#!/usr/bin/env python3
+"""Shut a Wine prefix or Bottles bottle down once nothing in it is in use any more.
+
+Windows apps often leave background processes running after their main program closes: licence
+services (iLok's LDSvc, WavesLocalServer, UA Connect, ...), updaters, tray apps. On Windows that is
+harmless. Under Wine they keep the prefix's wineserver alive, and Bottles (Flatpak) starts every
+launch in a new sandbox with its own /tmp, so a later launch can't see the old wineserver and starts
+a second one on the same prefix. Two sets of services then fight over the registry, licences and
+ports: plugins hang while loading, windows misbehave.
+
+This watches one prefix and, once it has been idle for a while (no Wine window open and none of the
+"keep" programs running), stops it: `wineserver -k` first, so Wine shuts down normally, and a
+signal only for whatever is still left. Background apps (UA Connect, licence services, tray apps)
+are stopped too; they start again with the next program that needs them.
+
+Usage:
+  wine-bottle-guard (--bottle NAME | --prefix PATH) [options] COMMAND
+
+Commands:
+  status              show what runs in the prefix and whether the watcher would stop it
+  watch [--dry-run]   keep running; stop the prefix after it has been idle for --grace seconds
+  clean [--force]     stop the prefix now, unless it is in use (--force: regardless)
+  launch [-- CMD...]  stop leftovers, then start the program (point your launcher/shortcut here)
+  service [--enable]  write a systemd user service that runs `watch` with these options
+
+Options:
+  --bottle NAME       Bottles bottle, by name or folder (Flatpak or native Bottles)
+  --prefix PATH       plain Wine prefix (WINEPREFIX); processes without WINEPREFIX count as ~/.wine
+  --keep A.exe,B.exe  programs that keep the prefix in use even without a window (tray apps, ...)
+  --grace SECONDS     how long the prefix has to be idle before it is stopped (default 30)
+  --program NAME      launch: the bottle's program entry, as in Bottles (bottles-cli run -p)
+  --exe PATH          launch: the program's .exe (Unix path). For a bottle that is already in use
+                      (e.g. FL Studio open), launch starts the program inside that bottle's running
+                      sandbox instead of a new one, which would start a second wineserver on the same
+                      bottle; that needs the .exe, from --exe or else from the --program entry in
+                      bottle.yml (Bottles doesn't list every program there). The program then starts in
+                      its folder, with the arguments set for it in Bottles.
+  --dry-run           watch/clean/launch: only report what would be done
+
+Examples:
+  wine-bottle-guard --bottle "FL Studio" --keep FL64.exe,Splice.exe service --enable
+  wine-bottle-guard --bottle "FL Studio" --program FL64 --exe ".../drive_c/.../FL64.exe" launch
+  wine-bottle-guard --prefix ~/.wine-daw --keep FL64.exe launch -- wine "C:\\...\\FL64.exe"
+
+What counts as in use: a Wine window (any window whose X11 class or Hyprland class ends in .exe,
+except Wine's untitled tray window; windows of other prefixes count too, as they can't be told
+apart reliably), one of the --keep programs or a setup program (msiexec, wineboot, winecfg, ...),
+Bottles' start.exe (it waits for the program it started), or a launch in the last 90 seconds. If
+no window list can be read at all, the prefix counts as in use, so nothing is ever stopped blindly.
+Windowless installers that aren't in that list: pause the watcher first with
+  touch ~/.cache/wine-bottle-guard.pause      (delete the file to resume)
+"""
+import ctypes
+import ctypes.util
+import fcntl
+import hashlib
+import json
+import os
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+BOTTLES_DIRS = {
+    "flatpak": os.path.expanduser("~/.var/app/com.usebottles.bottles/data/bottles"),
+    "native": os.path.expanduser("~/.local/share/bottles"),
+}
+BUSY_DEFAULT = {"start.exe", "wineboot.exe", "msiexec.exe", "winecfg.exe", "regedit.exe", "wusa.exe", "cmd.exe",
+                "setup.exe", "install.exe", "uninstall.exe", "unins000.exe"}
+LAUNCH_HOLD = 90
+POLL = 3
+PAUSE_FILE = os.path.expanduser("~/.cache/wine-bottle-guard.pause")
+
+
+def log(msg):
+    print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
+
+
+def warn(msg):
+    log("WARNING: " + msg)
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-u", "critical", "wine-bottle-guard", msg], check=False)
+
+
+def die(msg):
+    print(f"wine-bottle-guard: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def norm(path):
+    return os.path.realpath(os.path.expanduser(path))
+
+
+# --------------------------------------------------------------------------------------------- target
+
+class Target:
+    def __init__(self, opts):
+        self.bottle = self.bottle_flavour = None
+        if opts["bottle"]:
+            self.bottle, self.prefix, self.bottle_flavour = find_bottle(opts["bottle"])
+        elif opts["prefix"]:
+            self.prefix = norm(opts["prefix"])
+        else:
+            die("give --bottle NAME or --prefix PATH")
+        if not os.path.isfile(os.path.join(self.prefix, "system.reg")):
+            die(f"{self.prefix} is not a Wine prefix (no system.reg)")
+        self.keep = BUSY_DEFAULT | {n.strip().lower() for n in opts["keep"].split(",") if n.strip()}
+        self.grace = opts["grace"]
+        self.program, self.exe = opts["program"], opts["exe"]
+        key = hashlib.sha1(self.prefix.encode()).hexdigest()[:10]
+        run = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+        self.lock_file = f"{run}/wine-bottle-guard-{key}.lock"
+        self.stamp_file = f"{run}/wine-bottle-guard-{key}.launch"
+
+
+def find_bottle(name):
+    """(bottle name, prefix path, 'flatpak'|'native') for a bottle given by name or folder."""
+    for flavour, base in BOTTLES_DIRS.items():
+        bottles = os.path.join(base, "bottles")
+        if not os.path.isdir(bottles):
+            continue
+        for folder in sorted(os.listdir(bottles)):
+            path = os.path.join(bottles, folder)
+            display = None
+            try:
+                with open(os.path.join(path, "bottle.yml"), errors="replace") as f:
+                    for line in f:
+                        if line.startswith("Name:"):
+                            display = line.split(":", 1)[1].strip().strip("'\"")
+                            break
+            except OSError:
+                continue
+            if name in (folder, display):
+                return display or folder, norm(path), flavour
+    die(f"no Bottles bottle named {name!r} in {' or '.join(BOTTLES_DIRS.values())}")
+
+
+# ------------------------------------------------------------------------------------------ processes
+
+class Proc:
+    def __init__(self, pid, exe, name, cmdline, instance, env):
+        self.pid, self.exe, self.name, self.cmdline, self.instance, self.env = pid, exe, name, cmdline, instance, env
+        self.is_server = os.path.basename(exe) == "wineserver"
+
+
+def is_wine_binary(exe):
+    base = os.path.basename(exe)
+    return base in ("wine", "wine64", "wineserver") or (base.startswith("wine") and "preloader" in base)
+
+
+def prefix_procs(target):
+    """Wine processes of the target prefix, recognised by their own WINEPREFIX."""
+    found = []
+    default_prefix = norm("~/.wine")
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            exe = os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)")
+            if not is_wine_binary(exe):
+                continue
+            with open(f"/proc/{pid}/stat") as f:
+                if f.read().rsplit(")", 1)[1].split()[0] == "Z":
+                    continue
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                env = [v for v in f.read().split(b"\0") if v]
+            prefix = next((v[11:].decode(errors="surrogateescape") for v in env if v.startswith(b"WINEPREFIX=")), None)
+            if (norm(prefix) if prefix else default_prefix) != target.prefix:
+                continue
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                args = f.read().split(b"\0")
+            name = args[0].decode(errors="replace").replace("\\", "/").rsplit("/", 1)[-1]
+            instance = None
+            try:
+                with open(f"/proc/{pid}/root/.flatpak-info") as f:
+                    for line in f:
+                        if line.startswith("instance-id="):
+                            instance = line.split("=", 1)[1].strip()
+            except OSError:
+                pass
+            found.append(Proc(pid, exe, name, b" ".join(args).decode(errors="replace").strip(), instance, env))
+        except (OSError, IndexError):
+            continue  # gone meanwhile, or not ours to read
+    return found
+
+
+# -------------------------------------------------------------------------------------------- windows
+
+def x11_windows():
+    """(class, title) of the X11 clients the window manager lists, or None if it can't be read."""
+    lib = ctypes.util.find_library("X11")
+    if not lib or not os.environ.get("DISPLAY"):
+        return None
+    x = ctypes.cdll.LoadLibrary(lib)
+    Atom = Window = ctypes.c_ulong
+    x.XOpenDisplay.restype = ctypes.c_void_p
+    x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x.XInternAtom.restype = Atom
+    x.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    x.XDefaultRootWindow.restype = Window
+    x.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    x.XGetWindowProperty.argtypes = [ctypes.c_void_p, Window, Atom, ctypes.c_long, ctypes.c_long, ctypes.c_int,
+                                     Atom, ctypes.POINTER(Atom), ctypes.POINTER(ctypes.c_int),
+                                     ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+                                     ctypes.POINTER(ctypes.c_void_p)]
+    x.XFree.argtypes = [ctypes.c_void_p]
+    x.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    handler = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)(lambda d, e: 0)
+    x.XSetErrorHandler(handler)  # a window may be destroyed while we read it
+    dpy = x.XOpenDisplay(None)
+    if not dpy:
+        return None
+
+    def prop(win, name, kind="ANY"):
+        atom = x.XInternAtom(dpy, name.encode(), 0)
+        req = 0 if kind == "ANY" else x.XInternAtom(dpy, kind.encode(), 0)
+        rtype, fmt, n, after, data = Atom(), ctypes.c_int(), ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_void_p()
+        if x.XGetWindowProperty(dpy, win, atom, 0, 1 << 20, 0, req, ctypes.byref(rtype), ctypes.byref(fmt),
+                                ctypes.byref(n), ctypes.byref(after), ctypes.byref(data)) or not data.value:
+            return None
+        try:
+            if fmt.value == 32:
+                return list((ctypes.c_ulong * n.value).from_address(data.value))
+            return ctypes.string_at(data.value, n.value * fmt.value // 8)
+        finally:
+            x.XFree(data)
+
+    try:
+        clients = prop(x.XDefaultRootWindow(dpy), "_NET_CLIENT_LIST", "WINDOW")
+        if clients is None:
+            return None  # no EWMH window manager: can't tell
+        result = []
+        for w in clients:
+            cls = prop(w, "WM_CLASS") or b""
+            title = prop(w, "_NET_WM_NAME") or prop(w, "WM_NAME") or b""
+            parts = [p.decode(errors="replace").lower() for p in cls.split(b"\0") if p]
+            result.append((parts[-1] if parts else "", title.decode(errors="replace")))
+        return result
+    finally:
+        x.XCloseDisplay(dpy)
+
+
+def hyprland_windows():
+    """(class, title) of Hyprland's clients (X11 and Wayland, so also winewayland), or None."""
+    if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") or not shutil.which("hyprctl"):
+        return None
+    try:
+        out = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=5)
+        return [(c.get("class", "").lower(), c.get("title", "")) for c in json.loads(out.stdout)]
+    except (OSError, ValueError, subprocess.SubprocessError, AttributeError):
+        return None
+
+
+def wine_windows():
+    """Open Wine windows, or None if no window list could be read."""
+    lists = [w for w in (x11_windows(), hyprland_windows()) if w is not None]
+    if not lists:
+        return None
+    seen = set()
+    for cls, title in (w for lst in lists for w in lst):
+        if cls.endswith(".exe") and not (cls == "explorer.exe" and not title):
+            seen.add(f"{cls} {title!r}")
+    return sorted(seen)
+
+
+# ---------------------------------------------------------------------------------------------- logic
+
+def in_use(target, procs, honour_launch=True):
+    """Why the prefix counts as in use, or None."""
+    if os.path.exists(PAUSE_FILE):
+        return f"paused by {PAUSE_FILE}"
+    if honour_launch:
+        try:
+            if time.time() - os.path.getmtime(target.stamp_file) < LAUNCH_HOLD:
+                return "launch in progress"
+        except OSError:
+            pass
+    busy = sorted({p.name for p in procs if p.name.lower() in target.keep})
+    if busy:
+        return "running: " + ", ".join(busy)
+    wins = wine_windows()
+    if wins is None:
+        return "no window list available"
+    if wins:
+        return "window open: " + wins[0]
+    return None
+
+
+def server_command(server, *args, cwd=None):
+    """Run with the server's own environment, inside its Flatpak sandbox if it has one."""
+    env = [v.decode(errors="surrogateescape") for v in server.env if not v.startswith(b"WINEDEBUG=")]
+    cmd = ["env", "-i", *(["-C", cwd] if cwd else []), *env, *args]
+    return ["flatpak", "enter", server.instance, *cmd] if server.instance else cmd
+
+
+def wait_gone(target, seconds):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if not prefix_procs(target):
+            return True
+        time.sleep(0.2)
+    return not prefix_procs(target)
+
+
+def signal_all(target, sig):
+    for p in prefix_procs(target):
+        try:
+            os.kill(p.pid, sig)
+        except OSError:
+            pass
+
+
+def shutdown(target, dry_run=False):
+    """wineserver -k for every wineserver of the prefix; signals only for what is left after that."""
+    procs = prefix_procs(target)
+    if not procs:
+        return True
+    servers = [p for p in procs if p.is_server]
+    names = ", ".join(sorted({p.name for p in procs if not p.is_server}))
+    log(f"stopping {len(procs)} processes, {len(servers)} wineserver(s): {names}"[:400])
+    if dry_run:
+        log("dry run: nothing done")
+        return True
+    for s in servers:
+        try:
+            # its exit code doesn't say whether it worked (9 in testing); what's left afterwards does
+            subprocess.run(server_command(s, s.exe, "-k"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=10)
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"wineserver -k failed: {e}")
+    if servers and wait_gone(target, 10):
+        log("all stopped")
+        return True
+    log(("left after wineserver -k: " if servers else "no wineserver left to stop them: ") + ", ".join(sorted({p.name for p in prefix_procs(target)})))
+    signal_all(target, signal.SIGTERM)
+    if wait_gone(target, 3):
+        log("all stopped after SIGTERM")
+        return True
+    signal_all(target, signal.SIGKILL)
+    ok = wait_gone(target, 3)
+    log("all stopped after SIGKILL" if ok else "STILL RUNNING: " + ", ".join(p.name for p in prefix_procs(target)))
+    return ok
+
+
+class Lock:
+    def __init__(self, target):
+        self.path = target.lock_file
+
+    def __enter__(self):
+        self.f = open(self.path, "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+
+    def __exit__(self, *a):
+        self.f.close()
+
+
+# ------------------------------------------------------------------------------------------- commands
+
+def cmd_status(target):
+    procs = prefix_procs(target)
+    print(f"prefix {target.prefix}" + (f" (bottle {target.bottle!r}, {target.bottle_flavour})" if target.bottle else ""))
+    for inst in sorted({p.instance for p in procs}, key=str):
+        members = [p for p in procs if p.instance == inst]
+        where = f"Flatpak sandbox {inst}" if inst else "outside Flatpak"
+        server = "wineserver" if any(p.is_server for p in members) else "NO wineserver (orphaned)"
+        print(f"{where}: {len(members)} processes, {server}")
+        for p in members:
+            print(f"  {p.pid:>8} {p.cmdline[:100]}")
+    if not procs:
+        print("nothing running")
+    wins = wine_windows()
+    print("window list:", "unavailable" if wins is None else (", ".join(wins) or "no Wine windows"))
+    print("in use:", in_use(target, procs) or f"no, `watch` would stop it after {target.grace:.0f} s")
+    return 0
+
+
+def cmd_watch(target, dry_run):
+    log(f"watching {target.prefix}, grace {target.grace:.0f} s" + (", dry run" if dry_run else ""))
+    last, active_at, seen = None, time.monotonic(), False
+    while True:
+        procs = prefix_procs(target)
+        if not procs:
+            if seen:
+                log("prefix stopped")
+            seen, last = False, None
+            time.sleep(POLL)
+            continue
+        reason = in_use(target, procs)
+        if not seen or reason:
+            seen, active_at = True, time.monotonic()  # a prefix that just started gets the full grace period
+        if reason != last:
+            log(f"in use: {reason}" if reason else f"idle, {len(procs)} processes")
+            last = reason
+        if not reason and time.monotonic() - active_at >= target.grace:
+            with Lock(target):
+                if not in_use(target, prefix_procs(target)):
+                    shutdown(target, dry_run)
+            active_at = time.monotonic()
+        time.sleep(POLL)
+
+
+def cmd_clean(target, force, dry_run):
+    with Lock(target):
+        reason = in_use(target, prefix_procs(target))
+        if reason and not force:
+            print(f"not stopping, in use: {reason} (--force overrides)")
+            return 1
+        return 0 if shutdown(target, dry_run) else 1
+
+
+def bottle_programs(target):
+    """The bottle's program entries from bottle.yml: {name: {"path", "folder", "arguments"}}."""
+    path = os.path.join(target.prefix, "bottle.yml")
+    try:
+        import yaml  # PyYAML, if installed
+        with open(path) as f:
+            entries = (yaml.safe_load(f) or {}).get("External_Programs") or {}
+        return {e["name"]: e for e in entries.values() if isinstance(e, dict) and e.get("name")}
+    except ImportError:
+        pass
+    except (OSError, ValueError, AttributeError, KeyError, TypeError):
+        return {}
+    except Exception:  # yaml.YAMLError
+        return {}
+    # Without PyYAML: enough of YAML for this block (8-space keys, folded plain or quoted scalars).
+    programs, entry, key, inside = {}, None, None, False
+    try:
+        with open(path, errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return {}
+    for line in lines:
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            inside = line.startswith("External_Programs:")
+            continue
+        if not inside:
+            continue
+        if indent == 4:
+            entry, key = {}, None
+            programs[id(entry)] = entry
+        elif indent == 8 and ":" in line and entry is not None:
+            key, value = line.strip().split(":", 1)
+            entry[key] = value.strip()
+        elif indent > 8 and key:
+            entry[key] += " " + line.strip()
+    result = {}
+    for e in programs.values():
+        e = {k: (None if v in ("null", "~", "") else v.strip("'\"")) for k, v in e.items()}
+        if e.get("name"):
+            result[e["name"]] = e
+    return result
+
+
+def cmd_launch(target, cmd_args, dry_run):
+    if target.bottle:
+        if not (target.program or target.exe):
+            die("launch needs --program NAME or --exe PATH for a bottle")
+        cli = (["flatpak", "run", "--command=bottles-cli", "com.usebottles.bottles"]
+               if target.bottle_flavour == "flatpak" else ["bottles-cli"])
+        start = [*cli, "run", "-b", target.bottle,
+                 *(["-p", target.program] if target.program else ["-e", target.exe]), "--", *cmd_args]
+    else:
+        if not cmd_args:
+            die("launch needs the command after --, e.g. -- wine 'C:\\\\path\\\\program.exe'")
+        start = cmd_args
+    # what to run when joining a bottle that is in use (see below)
+    join_exe, join_cwd, join_args = target.exe, None, []
+    if target.bottle and target.program:
+        entry = bottle_programs(target).get(target.program)
+        if entry:
+            join_exe = target.exe or entry.get("path")
+            join_cwd = entry.get("folder")
+            join_args = shlex.split(entry.get("arguments") or "")
+    if join_exe:
+        join_cwd = join_cwd or os.path.dirname(join_exe)  # Bottles starts a program in its folder too
+    with Lock(target):
+        procs = prefix_procs(target)
+        reason = in_use(target, procs, honour_launch=False)
+        servers = [p for p in procs if p.is_server]
+        if not dry_run:
+            open(target.stamp_file, "w").close()
+        if procs and not reason:
+            shutdown(target, dry_run)
+        elif procs and target.bottle and len(servers) == 1 and servers[0].instance:
+            # Something in the bottle is still in use, in a Flatpak sandbox whose wineserver a new
+            # sandbox couldn't see: start the program in that sandbox instead of a second wineserver.
+            s = servers[0]
+            if join_exe:
+                log(f"joining sandbox {s.instance}, in use: {reason}")
+                start = server_command(s, os.path.join(os.path.dirname(s.exe), "wine"), join_exe, *join_args,
+                                       *cmd_args, cwd=join_cwd)
+            else:
+                warn(f"{target.bottle} is in use ({reason}), but there is no .exe for program "
+                     f"{target.program!r} in bottle.yml, so it can't join the running bottle: starting it in "
+                     f"a second sandbox, with a second wineserver. Give --exe PATH to avoid this.")
+        elif procs:
+            log(f"in use ({reason}), {len(servers)} wineserver(s): starting normally")
+    env = dict(os.environ)
+    if not target.bottle:
+        env["WINEPREFIX"] = target.prefix
+    log("starting: " + shlex.join(start))
+    if dry_run:
+        return 0
+    os.execvpe(start[0], start, env)
+
+
+def cmd_service(argv, target, enable):
+    script = os.path.realpath(sys.argv[0])
+    slug = "".join(c if c.isalnum() else "-" for c in (target.bottle or os.path.basename(target.prefix))).strip("-")
+    name = f"wine-bottle-guard-{slug.lower()}.service"
+    quoted = " ".join('"' + a.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
+                      for a in [script, *argv, "watch"])
+    unit = f"""[Unit]
+Description=Stop Wine prefix {target.prefix.replace("%", "%%")} once it is idle
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart={quoted}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
+"""
+    path = os.path.expanduser(f"~/.config/systemd/user/{name}")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(unit)
+    print(f"wrote {path}")
+    if enable:
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        subprocess.run(["systemctl", "--user", "enable", "--now", name], check=True)
+        print(f"enabled; follow it with: journalctl --user -u {name} -f")
+    else:
+        print(f"enable it with: systemctl --user daemon-reload && systemctl --user enable --now {name}")
+    return 0
+
+
+# ----------------------------------------------------------------------------------------------- main
+
+def main():
+    argv = sys.argv[1:]
+    opts = {"bottle": None, "prefix": None, "keep": "", "grace": 30.0, "program": None, "exe": None}
+    flags, cmd, cmd_args, target_argv = set(), None, [], []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            cmd_args = argv[i + 1:]
+            break
+        if a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        key = a[2:] if a.startswith("--") else None
+        if key in opts:
+            if i + 1 >= len(argv):
+                die(f"{a} needs a value")
+            value = argv[i + 1]
+            if key == "grace":
+                try:
+                    value = float(value)
+                except ValueError:
+                    die("--grace needs a number of seconds")
+            opts[key] = value
+            target_argv += [a, argv[i + 1]]
+            i += 2
+            continue
+        if a in ("--dry-run", "--force", "--enable"):
+            flags.add(a)
+        elif cmd is None and not a.startswith("-"):
+            cmd = a
+        else:
+            die(f"unknown argument {a!r} (see --help)")
+        i += 1
+    target = Target(opts)
+    cmd = cmd or "status"
+    if cmd == "status":
+        return cmd_status(target)
+    if cmd == "watch":
+        return cmd_watch(target, "--dry-run" in flags)
+    if cmd == "clean":
+        return cmd_clean(target, "--force" in flags, "--dry-run" in flags)
+    if cmd == "launch":
+        return cmd_launch(target, cmd_args, "--dry-run" in flags)
+    if cmd == "service":
+        return cmd_service(target_argv, target, "--enable" in flags)
+    die(f"unknown command {cmd!r} (see --help)")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
