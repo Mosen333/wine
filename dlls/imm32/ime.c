@@ -560,7 +560,12 @@ BOOL WINAPI ImeProcessKey( HIMC himc, UINT vkey, LPARAM lparam, BYTE *state )
     if (!is_ime_hkl( GetKeyboardLayout( 0 ) )) return FALSE;
 
     if (!(ctx = ImmLockIMC( himc ))) return FALSE;
-    ret = TRUE; /* TODO: should be ctx->fOpen */
+    /* Only an open IME takes keys.  The XIM path leaves the IME layout active after a composition
+     * and closes the context instead; taking every key then turned them all into VK_PROCESSKEY for
+     * applications that read WM_KEYDOWN without TranslateMessage (FL Studio's menus ignored the
+     * arrow keys after Japanese input).  Keys for a composition are filtered by the input method
+     * before they reach Wine, and starting one opens the context again. */
+    ret = ctx->fOpen;
     switch (LOWORD(vkey))
     {
         case VK_SHIFT:
