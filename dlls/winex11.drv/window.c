@@ -517,6 +517,19 @@ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, BOOL fullscreen )
         if ((ex & (WS_EX_TOOLWINDOW | WS_EX_TOPMOST)) == (WS_EX_TOOLWINDOW | WS_EX_TOPMOST) &&
             !(ex & WS_EX_APPWINDOW) && !NtUserGetWindowRelative( hwnd, GW_OWNER ))
             return FALSE;
+        /* An edit control shown on its own as an owned popup is an inline value editor
+         * (iZotope's "Edit" for a parameter value).  The plug-in activates it and closes
+         * it on deactivation, so a window manager that hands the focus back to the window
+         * under the pointer closed it at the first mouse move.  Keys still reach it
+         * through its owner's X window. */
+        if (!(style & WS_SYSMENU) && !(ex & WS_EX_APPWINDOW) && NtUserGetWindowRelative( hwnd, GW_OWNER ))
+        {
+            WCHAR buffer[16];
+            UNICODE_STRING name = { 0, sizeof(buffer), buffer };
+            INT len = NtUserGetClassName( hwnd, TRUE, &name );
+
+            if (len == 4 && !wcsnicmp( buffer, u"Edit", 4 )) return FALSE;
+        }
     }
     /* activated windows are managed */
     if (!(swp_flags & (SWP_NOACTIVATE|SWP_HIDEWINDOW))) return TRUE;
