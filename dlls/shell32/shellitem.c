@@ -236,6 +236,65 @@ static HRESULT WINAPI ShellItem_BindToHandler(IShellItem2 *iface, IBindCtx *pbc,
         return ShellItem_BindToHandler(&This->IShellItem2_iface, pbc, &BHID_SFUIObject,
                                        &IID_IDataObject, ppvOut);
     }
+    else if (IsEqualGUID(rbhid, &BHID_EnumItems))
+    {
+        /* The children of a folder item, as shell items: what file browsers
+         * built on IShellItem list a folder with. */
+        LPITEMIDLIST *children = NULL, child;
+        IShellItemArray *array;
+        IEnumIDList *enum_idlist;
+        IShellFolder *psf;
+        ULONG count = 0, capacity = 0, fetched, i;
+
+        if (FAILED(ret = ShellItem_get_shellfolder(This, pbc, &psf)))
+            return ret;
+
+        ret = IShellFolder_EnumObjects(psf, NULL, SHCONTF_FOLDERS | SHCONTF_NONFOLDERS, &enum_idlist);
+        if (ret == S_OK)
+        {
+            while (IEnumIDList_Next(enum_idlist, 1, &child, &fetched) == S_OK && fetched)
+            {
+                if (count == capacity)
+                {
+                    LPITEMIDLIST *grown;
+                    capacity = capacity ? capacity * 2 : 32;
+                    if (!(grown = realloc(children, capacity * sizeof(*children))))
+                    {
+                        ILFree(child);
+                        ret = E_OUTOFMEMORY;
+                        break;
+                    }
+                    children = grown;
+                }
+                children[count++] = child;
+            }
+            IEnumIDList_Release(enum_idlist);
+        }
+        else if (ret == S_FALSE)
+            ret = S_OK; /* nothing to enumerate */
+
+        if (SUCCEEDED(ret))
+        {
+            ret = SHCreateShellItemArray(This->pidl, psf, count, (PCUITEMID_CHILD_ARRAY)children, &array);
+            if (SUCCEEDED(ret))
+            {
+                IEnumShellItems *enum_items;
+
+                ret = IShellItemArray_EnumItems(array, &enum_items);
+                if (SUCCEEDED(ret))
+                {
+                    ret = IEnumShellItems_QueryInterface(enum_items, riid, ppvOut);
+                    IEnumShellItems_Release(enum_items);
+                }
+                IShellItemArray_Release(array);
+            }
+        }
+
+        for (i = 0; i < count; i++) ILFree(children[i]);
+        free(children);
+        IShellFolder_Release(psf);
+        return ret;
+    }
 
     FIXME("Unsupported BHID %s.\n", debugstr_guid(rbhid));
 
