@@ -101,6 +101,7 @@ HRESULT WINAPI RecycleBin_Constructor(IUnknown * pUnkOuter, REFIID riif, LPVOID 
 HRESULT WINAPI QueryAssociations_Constructor(IUnknown *pUnkOuter, REFIID riid, LPVOID *ppOutput);
 HRESULT WINAPI ExplorerBrowser_Constructor(IUnknown *pUnkOuter, REFIID riid, LPVOID *ppv);
 HRESULT WINAPI KnownFolderManager_Constructor(IUnknown *pUnkOuter, REFIID riid, LPVOID *ppv);
+HRESULT WINAPI ShellLibrary_Constructor(IUnknown *outer, REFIID riid, void **obj);
 HRESULT WINAPI IFileOperation_Constructor(IUnknown *outer, REFIID riid, void **out);
 HRESULT WINAPI ActiveDesktop_Constructor(IUnknown *outer, REFIID riid, void **out);
 HRESULT WINAPI EnumerableObjectCollection_Constructor(IUnknown *outer, REFIID riid, void **obj);

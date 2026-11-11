@@ -82,6 +82,7 @@ static const struct {
 	{&CLSID_UnixFolder,     UnixFolder_Constructor},
 	{&CLSID_ExplorerBrowser,ExplorerBrowser_Constructor},
 	{&CLSID_KnownFolderManager, KnownFolderManager_Constructor},
+	{&CLSID_ShellLibrary,  ShellLibrary_Constructor},
 	{&CLSID_Shell,          IShellDispatch_Constructor},
 	{&CLSID_DestinationList, CustomDestinationList_Constructor},
 	{&CLSID_ShellImageDataFactory, ShellImageDataFactory_Constructor},
