@@ -774,6 +774,26 @@ static void focus_out( Display *display , HWND hwnd )
     if (!(NtUserGetWindowLongW( hwnd, GWL_STYLE ) & WS_MINIMIZE))
         send_message( hwnd, WM_CANCELMODE, 0, 0 );
 
+    /* The window manager handles the foreground through _NET_ACTIVE_WINDOW, which only names our
+     * windows: when it gives the focus to a window that isn't an X window at all (a Wayland window,
+     * the X focus is then None), the foreground stayed with us and the application was never
+     * deactivated.  Applications close their popups on deactivation (WM_ACTIVATEAPP): FL Studio's
+     * menus stayed open, and as an unmanaged window that doesn't take the focus, the compositor
+     * sent the pointer over them to the focused Wayland window instead. */
+    if (is_net_supported( x11drv_atom(_NET_ACTIVE_WINDOW) ))
+    {
+        Window focus;
+        int revert;
+
+        XGetInputFocus( display, &focus, &revert );
+        if (focus == None)
+        {
+            TRACE( "focus left the X windows, setting fg to desktop\n" );
+            NtUserSetForegroundWindowInternal( NtUserGetDesktopWindow() );
+            return;
+        }
+    }
+
     /* don't reset the foreground window, if the window which is
        getting the focus is a Wine window */
 
