@@ -2382,7 +2382,13 @@ static UINT window_update_client_config( struct x11drv_win_data *data )
         /* The window manager acknowledges _NET_WM_STATE_FULLSCREEN before it reconfigures the
          * window. In between all requests are complete and the current config is still the old
          * one; applying it would take the window out of fullscreen on the win32 side. */
-        if (!covers_monitor && (data->current_state.net_wm_state & (1 << NET_WM_STATE_FULLSCREEN))) return 0;
+        /* With ResizeUnframedWindows, the window manager decides the size of such windows (FL
+         * Studio, whose fullscreen requests a Hyprland rule suppresses): it may never make the window
+         * cover the monitor, and waiting for that kept the win32 rects at the monitor size while the
+         * X window floated smaller elsewhere, offsetting every mouse position in the application. */
+        if (!covers_monitor && (data->current_state.net_wm_state & (1 << NET_WM_STATE_FULLSCREEN)) &&
+            !(resize_unframed_windows && is_window_resizable( data, NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) )))
+            return 0;
         if (xinerama_get_fullscreen_monitors( &data->rects.visible, &old_generation, old_monitors )
             && xinerama_get_fullscreen_monitors( &data->current_state.rect, &generation, monitors )
             && !memcmp( old_monitors, monitors, sizeof(monitors) ))
