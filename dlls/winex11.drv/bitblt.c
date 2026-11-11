@@ -1806,6 +1806,7 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
     UINT alpha_mask = window_surface->alpha_mask, alpha_bits = window_surface->alpha_bits;
     struct x11drv_window_surface *surface = get_x11_surface( window_surface );
     XImage *ximage = surface->image->ximage;
+    GC unclipped_gc = 0;
     const unsigned char *src = color_bits;
     unsigned char *dst = (unsigned char *)ximage->data;
 
@@ -1853,8 +1854,16 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
      * leaves the keyed pixels opaque, and they stayed on screen (issue 434 -
      * Microsoft Agent's characters on a solid box).  Clear them to 0, which on
      * a premultiplied visual is fully transparent.  Surfaces without a colour
-     * key are left exactly as they were. */
-    if (alpha_mask && ximage->depth == 32 && window_surface->color_key != CLR_INVALID && shape_bits)
+     * key are left exactly as they were.
+     *
+     * The same goes for any 32-bit window without per-pixel alpha from
+     * UpdateLayeredWindow that has a window region (FL Studio's menus are DWM
+     * glass windows): the bounding shape set below does not hide the cut away
+     * pixels on XWayland, transparent pixels do.  FL fades a menu out by giving
+     * it a region once an entry is picked, and the entries outside it stayed
+     * on screen until the menu was destroyed. */
+    if (ximage->depth == 32 && shape_bits &&
+        (!alpha_mask || window_surface->color_key != CLR_INVALID))
     {
         int x, y, stride = ximage->bytes_per_line / sizeof(ULONG);
         UINT shape_stride = shape_info->bmiHeader.biSizeImage / abs( shape_info->bmiHeader.biHeight );
@@ -1864,12 +1873,20 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
         for (y = dirty->top; y < dirty->bottom; y++, ptr += stride, shape += shape_stride)
             for (x = dirty->left; x < dirty->right; x++)
                 if (!(shape[x / 8] & (0x80 >> (x % 8)))) ptr[x] = 0;
+
+        /* The surface clip follows the visible region, which for a window with
+         * a region is that region: the transparent pixels outside it would
+         * never reach the X window.  Put the image once without the clip when
+         * the shape changes, before the new bounding shape goes out. */
+        if (shape_changed) unclipped_gc = XCreateGC( gdi_display, surface->window, 0, NULL );
     }
 
-    if (!put_shm_image( ximage, &surface->image->shminfo, surface->window, surface->gc, rect, dirty ))
-        XPutImage( gdi_display, surface->window, surface->gc, ximage, dirty->left,
+    if (!put_shm_image( ximage, &surface->image->shminfo, surface->window,
+                        unclipped_gc ? unclipped_gc : surface->gc, rect, dirty ))
+        XPutImage( gdi_display, surface->window, unclipped_gc ? unclipped_gc : surface->gc, ximage, dirty->left,
                    dirty->top, rect->left + dirty->left, rect->top + dirty->top,
                    dirty->right - dirty->left, dirty->bottom - dirty->top );
+    if (unclipped_gc) XFreeGC( gdi_display, unclipped_gc );
 
     /* The surface bitmap lives in the shared memory segment XShmPutImage reads
      * from, and the server only reads it when it gets to the request.  Anything
