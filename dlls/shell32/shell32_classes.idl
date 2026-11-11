@@ -51,6 +51,13 @@ coclass ExplorerBrowser { interface IExplorerBrowser; }
 coclass KnownFolderManager { interface IKnownFolderManager; }
 
 [
+    helpstring("Shell Library"),
+    threading(both),
+    uuid(d9b3211d-e57f-4426-aaef-30a806add397)
+]
+coclass ShellLibrary { interface IShellLibrary; }
+
+[
     helpstring("Microsoft Shell Folder View Router"),
     threading(apartment),
     uuid(9ba05971-f6a8-11cf-a442-00a0c90a8f39)

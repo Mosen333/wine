@@ -81,6 +81,7 @@ SOURCES = \
 	shell32_tlb.idl \
 	shelldispatch.c \
 	shellitem.c \
+	shelllibrary.c \
 	shelllink.c \
 	shellole.c \
 	shellord.c \
