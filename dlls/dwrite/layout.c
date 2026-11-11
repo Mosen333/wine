@@ -4552,10 +4552,30 @@ static HRESULT WINAPI dwritetextlayout_HitTestTextPosition(IDWriteTextLayout4 *i
 
     if (position == layout->length)
     {
-        struct layout_line *line = LIST_ENTRY(list_tail(&layout->lines), struct layout_line, entry);
+        struct list *tail = list_tail(&layout->lines);
+        struct layout_line *line = tail ? LIST_ENTRY(tail, struct layout_line, entry) : NULL;
         UINT8 level;
 
-        run = layout_get_trailing_effective_run(layout);
+        /* An empty layout has no runs: put the caret at the start of its
+         * (possibly empty) line.  Text editors ask for exactly this when the
+         * field is empty. */
+        if (!(run = layout_get_trailing_effective_run(layout)))
+        {
+            metrics->textPosition = position;
+            metrics->length = 0;
+            metrics->left = layout->metrics.left;
+            metrics->top = layout->metrics.top;
+            metrics->width = 0.0f;
+            metrics->height = line ? line->metrics.height : layout->metrics.height;
+            metrics->bidiLevel = 0;
+            metrics->isText = TRUE;
+            metrics->isTrimmed = FALSE;
+
+            *point_x = metrics->left;
+            *point_y = metrics->top;
+            return S_OK;
+        }
+
         level = run->object ? run->bidi_level : run->run->u.regular.run.bidiLevel;
 
         metrics->textPosition = position;
