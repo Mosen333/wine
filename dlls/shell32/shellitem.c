@@ -504,8 +504,24 @@ static HRESULT WINAPI ShellItem2_GetUInt64(IShellItem2 *iface, REFPROPERTYKEY ke
 
 static HRESULT WINAPI ShellItem2_GetBool(IShellItem2 *iface, REFPROPERTYKEY key, BOOL *pf)
 {
+    /* PKEY_Volume_IsRoot; defined here so that propkey.h's declaration needs no definition */
+    static const PROPERTYKEY volume_is_root = {{0x9b174b35,0x40ff,0x11d2,{0xa2,0x7e,0x00,0xc0,0x4f,0xc3,0x08,0x71}}, 10};
     struct shell_item *This = impl_from_IShellItem2(iface);
-    FIXME("Stub: %p (%p, %p)\n", This, key, pf);
+
+    if (!pf) return E_INVALIDARG;
+    *pf = FALSE;
+
+    if (IsEqualGUID(&key->fmtid, &volume_is_root.fmtid) && key->pid == volume_is_root.pid)
+    {
+        WCHAR path[MAX_PATH];
+
+        /* file browsers ask this to tell drives from ordinary folders */
+        if (SHGetPathFromIDListW(This->pidl, path)) *pf = PathIsRootW(path);
+        TRACE("%p Volume_IsRoot -> %d\n", This, *pf);
+        return S_OK;
+    }
+
+    FIXME("Stub: %p ({%s,%lu}, %p)\n", This, debugstr_guid(&key->fmtid), key->pid, pf);
     return E_NOTIMPL;
 }
 
