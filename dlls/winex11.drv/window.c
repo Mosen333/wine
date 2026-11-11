@@ -1172,8 +1172,20 @@ static void set_size_hints( struct x11drv_win_data *data, DWORD style )
                 size_hints->flags |= PMinSize;
                 if (track.max_track.x && track.max_track.y)
                 {
-                    size_hints->max_width = max( track.max_track.x - frame_w, size_hints->min_width );
-                    size_hints->max_height = max( track.max_track.y - frame_h, size_hints->min_height );
+                    /* Chromium/Electron answer "no limit" with sizes close to INT_MAX.  X window
+                     * sizes are 16-bit anyway, and Hyprland adds the monitor offset to the X11
+                     * maximum size: on any monitor not at x = 0 that overflowed into a negative
+                     * maximum, and its dwindle layout floated the window again on every attempt
+                     * to tile it (Splice could only be tiled on the left monitor).  Compute in
+                     * 64 bits, the frame correction of such a size overflows too. */
+                    LONGLONG max_w = (LONGLONG)track.max_track.x - frame_w;
+                    LONGLONG max_h = (LONGLONG)track.max_track.y - frame_h;
+
+                    if (track.max_track.x <= 0) max_w = 32767; /* wrapped around in win32u's scaling */
+                    if (track.max_track.y <= 0) max_h = 32767;
+
+                    size_hints->max_width = min( max( max_w, size_hints->min_width ), 32767 );
+                    size_hints->max_height = min( max( max_h, size_hints->min_height ), 32767 );
                     size_hints->flags |= PMaxSize;
                 }
             }
