@@ -1593,6 +1593,7 @@ struct x11drv_window_surface
     int                   shape_kind;  /* ShapeBounding or ShapeInput once a mask is set, 0 before */
     DWORD                 input_shape_time;    /* tick of the last ShapeInput update */
     BOOL                  input_shape_pending; /* a contour change is waiting for the throttle */
+    UINT                  input_shape_burst;   /* ShapeInput updates in a row less than a second apart */
 };
 
 static struct x11drv_window_surface *get_x11_surface( struct window_surface *surface )
@@ -1916,8 +1917,12 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
             DWORD now = NtGetTickCount();
 
             kind = ShapeInput;
+            /* Only an animation is throttled: a few changes in a row go out at once.  A
+             * Chromium/Electron tray menu draws an empty frame first and its content right
+             * after; throttled, its input shape stayed empty until the next repaint after a
+             * second, and clicks went through the menu to the window below. */
             if (shape_changed && shape_bits && surface->shape_kind == ShapeInput &&
-                now - surface->input_shape_time < 1000)
+                now - surface->input_shape_time < 1000 && surface->input_shape_burst >= 3)
             {
                 surface->input_shape_pending = TRUE;
                 shape_changed = FALSE;
@@ -1955,7 +1960,10 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
             }
             if (kind == ShapeInput)
             {
-                surface->input_shape_time = NtGetTickCount();
+                DWORD now = NtGetTickCount();
+
+                surface->input_shape_burst = now - surface->input_shape_time < 1000 ? surface->input_shape_burst + 1 : 1;
+                surface->input_shape_time = now;
                 surface->input_shape_pending = FALSE;
             }
         }
