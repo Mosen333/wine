@@ -439,6 +439,50 @@ static BOOL has_owned_popups( HWND hwnd )
 }
 
 /* returns the HWND for the X11 window, or the desktop window if it isn't a Wine window */
+/* whether the X window rectangle of a popup lies inside the top-level X window that has
+ * the input focus (see set_wm_hints) */
+static BOOL popup_inside_x_focus( struct x11drv_win_data *data )
+{
+    Window focus, root, parent, child, *children;
+    int revert, fx = 0, fy = 0, px = 0, py = 0;
+    unsigned int fw = 0, fh = 0, pw = 0, ph = 0, border, depth, count;
+    BOOL ok = TRUE;
+
+    if (!data->whole_window) return TRUE;
+    XGetInputFocus( data->display, &focus, &revert );
+    if (focus == None || focus == PointerRoot) return FALSE;
+    if (focus == data->whole_window) return TRUE;
+
+    X11DRV_expect_error( data->display, host_window_error, NULL );
+    /* the focus may be a child of a top-level window */
+    for (;;)
+    {
+        if (!XQueryTree( data->display, focus, &root, &parent, &children, &count )) { ok = FALSE; break; }
+        if (children) XFree( children );
+        if (!parent || parent == root) break;
+        focus = parent;
+    }
+    /* While a Wayland window has the focus, the X focus may rest on the desktop window, which
+     * covers the whole desktop and has no class: that isn't an application window. */
+    if (ok)
+    {
+        XClassHint class_hint = { 0 };
+        if (!XGetClassHint( data->display, focus, &class_hint )) ok = FALSE;
+        if (class_hint.res_name) XFree( class_hint.res_name );
+        if (class_hint.res_class) XFree( class_hint.res_class );
+    }
+    if (ok) ok = XGetGeometry( data->display, focus, &root, &fx, &fy, &fw, &fh, &border, &depth ) &&
+                 XTranslateCoordinates( data->display, focus, root, 0, 0, &fx, &fy, &child ) &&
+                 XGetGeometry( data->display, data->whole_window, &root, &px, &py, &pw, &ph, &border, &depth ) &&
+                 XTranslateCoordinates( data->display, data->whole_window, root, 0, 0, &px, &py, &child );
+    if (X11DRV_check_error()) ok = FALSE;
+    if (!ok) return FALSE;
+
+    TRACE( "popup %lx %d,%d %ux%u, focus %lx %d,%d %ux%u\n", data->whole_window, px, py, pw, ph,
+           focus, fx, fy, fw, fh );
+    return px >= fx && py >= fy && px + (int)pw <= fx + (int)fw && py + (int)ph <= fy + (int)fh;
+}
+
 static HWND hwnd_from_window( Display *display, Window window )
 {
     HWND hwnd, desktop = NtUserGetDesktopWindow();
@@ -1496,9 +1540,17 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
      * its type says it doesn't want focus.  When such a window closes while a button is held
      * (FL Studio drags an entry out of its menu), the focus change re-enters the pointer and
      * XWayland releases the button, ending the drag.
+     *
+     * For such a window Hyprland hands the pointer to the focused window instead, so a menu
+     * typed that way only gets input where the focused X window lies underneath it.  Keep the
+     * menu type for owned popups (application and plug-in menus, which may be dragged from) and
+     * for popups inside the focused X window; ownerless ones elsewhere (tray icon menus opened
+     * from the bar) stay normal and are hit-tested themselves.
      */
     if ((style & WS_POPUP) && !(style & WS_CAPTION) && !data->managed)
-        window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_DROPDOWN_MENU );
+        window_set_net_wm_window_type( data, (owner || popup_inside_x_focus( data ))
+                                             ? XATOM__NET_WM_WINDOW_TYPE_DROPDOWN_MENU
+                                             : XATOM__NET_WM_WINDOW_TYPE_NORMAL );
     else if (((style & WS_POPUP) || (ex_style & WS_EX_DLGMODALFRAME)) && owner)
         window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_DIALOG );
     else if ((style & WS_POPUP) && (ex_style & WS_EX_TOOLWINDOW) && !owner
