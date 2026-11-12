@@ -2413,6 +2413,45 @@ BOOL WINAPI NtUserSetForegroundWindow( HWND hwnd )
 /*******************************************************************
  *		set_foreground_window
  */
+/* Called when the current thread loses the foreground to another thread.  On Windows a click
+ * on another application's window still reaches the window that captured the mouse, which is
+ * how an application's own popup (Electron/Chromium's tray and context menus) notices it and
+ * closes.  Such a click never reaches us when it lands on another X client or on a Wayland
+ * window, so release the capture: the window gets WM_CAPTURECHANGED and closes the popup.
+ * Wine's own menus and the move/size loop have their own handling. */
+void release_capture_for_deactivation(void)
+{
+    static const BYTE buttons[] = { VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2 };
+    const desktop_shm_t *desktop_shm;
+    struct object_lock lock = OBJECT_LOCK_INIT;
+    BYTE keystate[ARRAY_SIZE(buttons)] = {0};
+    GUITHREADINFO info;
+    NTSTATUS status;
+    HWND root;
+    UINT i;
+
+    info.cbSize = sizeof(info);
+    if (!NtUserGetGUIThreadInfo( GetCurrentThreadId(), &info ) || !info.hwndCapture) return;
+    if (info.flags & (GUI_INMENUMODE | GUI_INMOVESIZE)) return;
+
+    /* Only a popup menu: a frameless always-on-top popup.  Drag and drop and other captures of
+     * ordinary windows keep it; a tiling window manager activates other windows under a drag
+     * (FL Studio dragging from its plug-in picker onto the main window). */
+    root = NtUserGetAncestor( info.hwndCapture, GA_ROOT );
+    if (!(get_window_long( root, GWL_STYLE ) & WS_POPUP) || (get_window_long( root, GWL_STYLE ) & WS_CAPTION) ||
+        !(get_window_long( root, GWL_EXSTYLE ) & WS_EX_TOPMOST))
+        return;
+
+    /* a held button is a drag in progress */
+    while ((status = get_shared_desktop( &lock, &desktop_shm )) == STATUS_PENDING)
+        for (i = 0; i < ARRAY_SIZE(buttons); i++) keystate[i] = desktop_shm->keystate[buttons[i]];
+    if (status) return;
+    for (i = 0; i < ARRAY_SIZE(buttons); i++) if (keystate[i] & 0x80) return;
+
+    TRACE( "thread lost the foreground, releasing capture %p of popup %p\n", info.hwndCapture, root );
+    NtUserReleaseCapture();
+}
+
 BOOL set_foreground_window( HWND hwnd, BOOL mouse, BOOL internal )
 {
     BOOL ret, send_msg_old = FALSE, send_msg_new = FALSE;
@@ -2445,7 +2484,10 @@ BOOL set_foreground_window( HWND hwnd, BOOL mouse, BOOL internal )
             NtUserMessageCall( previous, WM_WINE_SETACTIVEWINDOW, 0, new_thread_id,
                                0, NtUserSendNotifyMessage, FALSE );
         else if (send_msg_new)  /* old window belongs to us but new one to other thread */
+        {
             ret = set_active_window( 0, NULL, mouse, TRUE, new_thread_id );
+            release_capture_for_deactivation();
+        }
 
         if (send_msg_new)  /* new window belongs to other thread */
             NtUserMessageCall( hwnd, WM_WINE_SETACTIVEWINDOW, (WPARAM)hwnd, old_thread_id,
