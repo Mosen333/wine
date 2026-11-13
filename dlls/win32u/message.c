@@ -40,6 +40,7 @@
 WINE_DEFAULT_DEBUG_CHANNEL(msg);
 WINE_DECLARE_DEBUG_CHANNEL(key);
 WINE_DECLARE_DEBUG_CHANNEL(relay);
+WINE_DECLARE_DEBUG_CHANNEL(dragtrace);
 
 #define QS_DRIVER       0x80000000
 #define QS_HARDWARE     0x40000000
@@ -4078,6 +4079,7 @@ BOOL WINAPI NtUserPostQuitMessage( INT exit_code )
 LRESULT WINAPI NtUserDispatchMessage( const MSG *msg )
 {
     struct win_proc_params params;
+    unsigned long long dt_start;
     LRESULT retval = 0;
 
     /* Process timer messages */
@@ -4112,11 +4114,22 @@ LRESULT WINAPI NtUserDispatchMessage( const MSG *msg )
 
     spy_enter_message( SPY_DISPATCHMESSAGE, msg->hwnd, msg->message, msg->wParam, msg->lParam );
 
+    dt_start = TRACE_ON(dragtrace) ? dragtrace_now() : 0;
     if (init_window_call_params( &params, msg->hwnd, msg->message, msg->wParam, msg->lParam,
                                  FALSE, WMCHAR_MAP_DISPATCHMESSAGE ))
         retval = dispatch_win_proc_params( &params, sizeof(params), NULL, NULL );
     else if (!is_window( msg->hwnd )) RtlSetLastWin32Error( ERROR_INVALID_WINDOW_HANDLE );
     else RtlSetLastWin32Error( ERROR_MESSAGE_SYNC_ONLY );
+    if (dt_start)
+    {
+        unsigned long long dur = dragtrace_now() - dt_start;
+        /* every paint, every input message, and anything else that takes a while */
+        if (msg->message == WM_PAINT || msg->message == WM_MOUSEMOVE || msg->message == WM_NCMOUSEMOVE ||
+            msg->message == WM_LBUTTONDOWN || msg->message == WM_LBUTTONUP ||
+            msg->message == WM_NCLBUTTONDOWN || dur >= 2000)
+            TRACE_(dragtrace)( "DT disp %llu %llu hwnd %p class %s msg %04x\n", dt_start, dur,
+                               msg->hwnd, dragtrace_class( msg->hwnd ), msg->message );
+    }
 
     spy_exit_message( SPY_RESULT_OK, msg->hwnd, msg->message, retval, msg->wParam, msg->lParam );
 

@@ -33,6 +33,15 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
+WINE_DECLARE_DEBUG_CHANNEL(dragtrace);
+
+const char *dragtrace_class( HWND hwnd )
+{
+    WCHAR buf[64];
+    UNICODE_STRING name = { 0, sizeof(buf), buf };
+    INT len = NtUserGetClassName( hwnd, FALSE, &name );
+    return debugstr_wn( buf, len > 0 ? len : 0 );
+}
 
 #define USER_HANDLE_TO_INDEX(hwnd) ((LOWORD(hwnd) - FIRST_USER_HANDLE) >> 1)
 #define USER_HANDLE_FROM_INDEX(index, generation) UlongToHandle( (index << 1) + FIRST_USER_HANDLE + (generation << 16) )
@@ -500,8 +509,14 @@ static void represent_client_surfaces( HWND hwnd )
 
     for (i = 0; i < count; i++)
     {
+        unsigned long long dt_start = TRACE_ON(dragtrace) ? dragtrace_now() : 0;
+        HWND client_hwnd = found[i]->hwnd;
+
         client_surface_present( found[i] );
         client_surface_release( found[i] );
+        if (dt_start)
+            TRACE_(dragtrace)( "DT represent %llu %llu hwnd %p class %s\n", dt_start, dragtrace_now() - dt_start,
+                               client_hwnd, dragtrace_class( client_hwnd ) );
     }
 }
 
@@ -2331,6 +2346,25 @@ static void update_surface_region( HWND hwnd )
     {
         NtGdiOffsetRgn( region, -visible.left, -visible.top );
         if (shape) NtGdiCombineRgn( region, region, shape, RGN_AND );
+        if (TRACE_ON(dragtrace))
+        {
+            char buf[sizeof(RGNDATAHEADER) + 64 * sizeof(RECT)];
+            RGNDATA *data = (RGNDATA *)buf;
+            DWORD i, count = 0;
+            char text[2048];
+            int len = 0;
+
+            if (NtGdiGetRegionData( region, sizeof(buf), data )) count = data->rdh.nCount;
+            text[0] = 0;
+            for (i = 0; i < count && i < 64 && len < (int)sizeof(text) - 64; i++)
+            {
+                RECT *r = (RECT *)data->Buffer + i;
+                len += snprintf( text + len, sizeof(text) - len, " (%d,%d)-(%d,%d)",
+                                 (int)r->left, (int)r->top, (int)r->right, (int)r->bottom );
+            }
+            TRACE_(dragtrace)( "DT clip %llu 0 hwnd %p class %s rects %u%s\n", dragtrace_now(), hwnd,
+                               dragtrace_class( hwnd ), (unsigned int)count, text );
+        }
         window_surface_set_clip( win->surface, region );
         NtGdiDeleteObjectApp( region );
     }
@@ -4514,6 +4548,7 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
     struct window_rects old_rects, new_rects;
     UINT orig_flags, context;
     BOOL ret = FALSE;
+    unsigned long long dt_start = 0;
 
     orig_flags = winpos->flags;
 
@@ -4558,6 +4593,7 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
 
     context = set_thread_dpi_awareness_context( get_window_dpi_awareness_context( winpos->hwnd ));
     get_user_thread_info()->swp_depth++;
+    dt_start = TRACE_ON(dragtrace) ? dragtrace_now() : 0;
 
     if (!calc_winpos( winpos, &old_rects, &new_rects )) goto done;
 
@@ -4693,6 +4729,11 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
         after_child_move( winpos->hwnd );
 
     ret = TRUE;
+    if (dt_start)
+        TRACE_(dragtrace)( "DT swp %llu %llu hwnd %p class %s depth %u flags %08x %s -> %s\n", dt_start,
+                           dragtrace_now() - dt_start, winpos->hwnd, dragtrace_class( winpos->hwnd ),
+                           get_user_thread_info()->swp_depth, winpos->flags,
+                           wine_dbgstr_rect( &old_rects.window ), wine_dbgstr_rect( &new_rects.window ) );
 done:
     get_user_thread_info()->swp_depth--;
     set_thread_dpi_awareness_context( context );
