@@ -475,6 +475,82 @@ void client_surface_wait( struct client_surface *surface, BOOL presented )
         surface->funcs->wait( surface, presented );
 }
 
+/* Present the last frame of the offscreen client surfaces in and below hwnd again,
+ * at their windows' current place.  A child that renders offscreen reaches the
+ * top-level only through the copy of each present, so when an ancestor moves inside
+ * the top-level its picture stays where it was until the application presents
+ * again - which a plugin editor in FL Studio (Kontakt 8's Qt/OpenGL UI) does only
+ * every so often, or after the repaint that a stream of mouse moves keeps from
+ * being delivered.  The offscreen client window still holds that frame, so copy it now. */
+static void represent_client_surfaces( HWND hwnd )
+{
+    struct client_surface *surface, *found[16];
+    unsigned int i, count = 0;
+
+    pthread_mutex_lock( &surfaces_lock );
+    LIST_FOR_EACH_ENTRY( surface, &client_surfaces, struct client_surface, entry )
+    {
+        if (count == ARRAY_SIZE(found)) break;
+        if (!surface->hwnd || !InterlockedCompareExchange( &surface->offscreen, 0, 0 )) continue;
+        if (surface->hwnd != hwnd && !is_child( hwnd, surface->hwnd )) continue;
+        client_surface_add_ref( surface );
+        found[count++] = surface;
+    }
+    pthread_mutex_unlock( &surfaces_lock );
+
+    for (i = 0; i < count; i++)
+    {
+        client_surface_present( found[i] );
+        client_surface_release( found[i] );
+    }
+}
+
+/* A child window moved on its own inside its top-level (FL Studio's plugin windows
+ * while they are dragged).  Its bits were copied within the top-level's window
+ * surface, but that surface reaches the screen only when the thread goes idle, or
+ * every 50 ms when it never does (flush_window_surfaces()), and a mouse sending
+ * events at 1 kHz keeps it busy for the whole drag: the window then moves at 20 fps
+ * while whatever draws to the screen directly - an editor in another process, a
+ * client surface - follows at once, and the two come apart.  Flush the top-level
+ * now, at most every WINE_DRAGFIX_FLUSH ms (default 8, 0 disables), and present the
+ * client surfaces below the window again (WINE_DRAGFIX_REPRESENT=0 disables). */
+static void after_child_move( HWND hwnd )
+{
+    static int flush_ms = -1, represent = -1;
+    static DWORD last_flush;
+    DWORD now;
+    WND *win;
+
+    if (flush_ms < 0)
+    {
+        const char *str = getenv( "WINE_DRAGFIX_FLUSH" );
+        flush_ms = str ? atoi( str ) : 8;
+        str = getenv( "WINE_DRAGFIX_REPRESENT" );
+        represent = str ? atoi( str ) : 1;
+    }
+
+    if (represent) represent_client_surfaces( hwnd );
+
+    if (flush_ms <= 0) return;
+    now = NtGetTickCount();
+    if ((int)(now - last_flush) < flush_ms) return;
+    last_flush = now;
+
+    win = get_win_ptr( NtUserGetAncestor( hwnd, GA_ROOT ) );
+    if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
+    {
+        struct window_surface *surface = win->surface;
+
+        if (surface) window_surface_add_ref( surface );
+        release_win_ptr( win );
+        if (surface)
+        {
+            window_surface_flush( surface );
+            window_surface_release( surface );
+        }
+    }
+}
+
 void client_surface_update( struct client_surface *surface )
 {
     pthread_mutex_lock( &surfaces_lock );
@@ -4551,6 +4627,10 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
 
     if ((winpos->flags & (SWP_NOSIZE|SWP_NOMOVE|SWP_FRAMECHANGED)) != (SWP_NOSIZE|SWP_NOMOVE))
         NtUserNotifyWinEvent( EVENT_OBJECT_LOCATIONCHANGE, winpos->hwnd, OBJID_WINDOW, 0 );
+
+    if (!(winpos->flags & SWP_NOMOVE) && get_user_thread_info()->swp_depth == 1 &&
+        (get_window_long( winpos->hwnd, GWL_STYLE ) & WS_CHILD))
+        after_child_move( winpos->hwnd );
 
     ret = TRUE;
 done:
