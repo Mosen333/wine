@@ -43,6 +43,8 @@ struct dce
     UINT        flags;
     LONG        count;         /* usage count; 0 or 1 for cache DCEs, always 1 for window DCEs,
                                   always >= 1 for class DCEs */
+    HWND        foreign_top;   /* top-level of another process this DC paints into */
+    RECT        foreign_rect;  /* window rect relative to that top-level's drawable */
 };
 
 static struct list dce_list = LIST_INIT(dce_list);
@@ -1005,6 +1007,15 @@ static void update_visible_region( struct dce *dce )
 
     user_driver->pGetDC( dce->hdc, dce->hwnd, top_win, &win_rect, &top_rect, flags );
 
+    /* remember where in a foreign top-level's drawable we paint, see check_foreign_move() */
+    dce->foreign_top = 0;
+    if (top_win && top_win != dce->hwnd && !is_current_process_window( top_win ))
+    {
+        dce->foreign_top = top_win;
+        dce->foreign_rect = win_rect;
+        OffsetRect( &dce->foreign_rect, -top_rect.left, -top_rect.top );
+    }
+
     if (dce->clip_rgn) NtGdiCombineRgn( vis_rgn, vis_rgn, dce->clip_rgn,
                                         (flags & DCX_INTERSECTRGN) ? RGN_AND : RGN_DIFF );
 
@@ -1119,6 +1130,7 @@ static struct dce *alloc_dce(void)
     }
     dce->hwnd      = 0;
     dce->clip_rgn  = 0;
+    dce->foreign_top = 0;
     dce->flags     = 0;
     dce->count     = 1;
 
@@ -1368,6 +1380,78 @@ void invalidate_dce( WND *win, const RECT *old_rect )
     set_thread_dpi_awareness_context( context );
 }
 
+/* A window whose top-level belongs to another process paints straight into
+ * that top-level's X window, at the offset taken when its visible region was
+ * computed (X11DRV_GetDC).  If the owner moves an ancestor inside the top-level
+ * while we paint -- FL Studio while a bridged plugin editor is dragged -- our
+ * drawing lands where the window was.  The owner has already repainted that
+ * spot for the move and its surface no longer clips us out there, so nothing
+ * paints over it again: thin strips of the editor stay behind on the trailing
+ * edges.  Check on release whether the window moved since the DC was set up;
+ * if so, push our drawing to the X server first and then have the owner
+ * repaint the old rect (and the window repaint at its new place). */
+static void check_foreign_move( struct dce *dce )
+{
+    enum { X11DRV_ESCAPE = 6789, X11DRV_SYNC_DISPLAY = 5 };
+    DWORD code = X11DRV_SYNC_DISPLAY;
+    struct window_rects rects;
+    RECT win_rect, top_rect, old;
+    HWND top_win = 0;
+    NTSTATUS status;
+
+    if (!dce->foreign_top) return;
+
+    SERVER_START_REQ( get_visible_region )
+    {
+        req->window = wine_server_user_handle( dce->hwnd );
+        req->flags  = dce->flags;
+        /* no reply buffer: only the rects are needed, the region overflows */
+        status = wine_server_call( req );
+        if (!status || status == STATUS_BUFFER_OVERFLOW)
+        {
+            top_win  = wine_server_ptr_handle( reply->top_win );
+            win_rect = wine_server_get_rect( reply->win_rect );
+            top_rect = wine_server_get_rect( reply->top_rect );
+        }
+    }
+    SERVER_END_REQ;
+
+    if (top_win != dce->foreign_top) return;
+    OffsetRect( &win_rect, -top_rect.left, -top_rect.top );
+    if (EqualRect( &win_rect, &dce->foreign_rect )) return;
+
+    TRACE( "%p moved in foreign top-level %p: %s -> %s\n", dce->hwnd, top_win,
+           wine_dbgstr_rect( &dce->foreign_rect ), wine_dbgstr_rect( &win_rect ) );
+
+    NtGdiExtEscape( dce->hdc, NULL, 0, X11DRV_ESCAPE, sizeof(code), (char *)&code, 0, NULL );
+
+    /* the old rect, from drawable to top-level client coordinates (server
+     * coordinates are taken as the thread's, i.e. no DPI scaling) */
+    old = dce->foreign_rect;
+    OffsetRect( &old, top_rect.left, top_rect.top );
+    if (get_window_rects( top_win, COORDS_SCREEN, &rects, get_thread_dpi() ))
+        OffsetRect( &old, -rects.client.left, -rects.client.top );
+    /* only the part of the old rect the window has left; the window itself was
+     * invalidated by the server when it moved (invalidate_unsurfaced_descendants) */
+    {
+        RECT cur = win_rect;
+        HRGN rgn, cur_rgn;
+
+        OffsetRect( &cur, old.left - dce->foreign_rect.left, old.top - dce->foreign_rect.top );
+        rgn = NtGdiCreateRectRgn( old.left, old.top, old.right, old.bottom );
+        cur_rgn = NtGdiCreateRectRgn( cur.left, cur.top, cur.right, cur.bottom );
+        if (NtGdiCombineRgn( rgn, rgn, cur_rgn, RGN_DIFF ) > NULLREGION)
+            NtUserRedrawWindow( top_win, NULL, rgn, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN );
+        NtGdiDeleteObjectApp( cur_rgn );
+        NtGdiDeleteObjectApp( rgn );
+    }
+
+    /* an owned DC keeps its offset otherwise; recompute it on the next use */
+    user_lock();
+    make_dc_dirty( dce );
+    user_unlock();
+}
+
 /***********************************************************************
  *           release_dc
  */
@@ -1378,6 +1462,12 @@ static INT release_dc( HWND hwnd, HDC hdc, BOOL end_paint )
     BOOL ret = FALSE;
 
     TRACE( "%p %p\n", hwnd, hdc );
+
+    user_lock();
+    dce = get_dc_dce( hdc );
+    if (!dce || !dce->count || !dce->hwnd || !dce->foreign_top) dce = NULL;
+    user_unlock();
+    if (dce) check_foreign_move( dce );
 
     user_lock();
     dce = get_dc_dce( hdc );
