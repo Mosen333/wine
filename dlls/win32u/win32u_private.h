@@ -31,6 +31,17 @@
 #include "wine/unixlib.h"
 #include "wine/debug.h"
 #include "wine/server.h"
+#include <time.h>
+
+/* dragtrace: timing of window moves, paints and presents (WINEDEBUG=+dragtrace),
+ * in microseconds of CLOCK_BOOTTIME, the clock of QueryPerformanceCounter */
+static inline unsigned long long dragtrace_now(void)
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_BOOTTIME, &ts );
+    return ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
+}
+extern const char *dragtrace_class( HWND hwnd );
 
 
 /* clipboard.c */

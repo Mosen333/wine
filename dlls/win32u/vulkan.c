@@ -43,6 +43,7 @@ static void *vulkan_handle;
 static struct vulkan_funcs vulkan_funcs;
 
 WINE_DECLARE_DEBUG_CHANNEL(fps);
+WINE_DECLARE_DEBUG_CHANNEL(dragtrace);
 
 static const struct vulkan_driver_funcs *driver_funcs;
 
@@ -2046,7 +2047,18 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         client_surface_wait( surface->client, FALSE );
     }
 
-    res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
+    {
+        unsigned long long dt_start = TRACE_ON(dragtrace) ? dragtrace_now() : 0;
+        res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
+        if (dt_start)
+            for (uint32_t i = 0; i < present_info->swapchainCount; i++)
+            {
+                struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
+                TRACE_(dragtrace)( "DT vkpresent %llu %llu hwnd %p class %s\n", dt_start,
+                                   dragtrace_now() - dt_start, swapchain->surface->hwnd,
+                                   dragtrace_class( swapchain->surface->hwnd ) );
+            }
+    }
 
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
     {

@@ -32,6 +32,7 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(dib);
+WINE_DECLARE_DEBUG_CHANNEL(dragtrace);
 
 static const DWORD bit_fields_888[3] = {0xff0000, 0x00ff00, 0x0000ff};
 static const DWORD bit_fields_555[3] = {0x7c00, 0x03e0, 0x001f};
@@ -535,11 +536,22 @@ static void check_surface_moved( struct windrv_physdev *dev )
 {
     DC *dc;
 
+    if (TRACE_ON(dragtrace) && dev->owner_tid && dev->owner_tid != GetCurrentThreadId())
+    {
+        dc = get_physdev_dc( &dev->dev );
+        TRACE_(dragtrace)( "DT xdraw %llu 0 hwnd %p class L\"\" hdc %p vis %s serial %d/%d dirty %d\n",
+                           dragtrace_now(), dev->surface->hwnd, dc->hSelf,
+                           wine_dbgstr_rect( &dc->attr->vis_rect ), (int)dev->move_serial,
+                           (int)ReadNoFence( &dev->surface->move_serial ), (int)dc->dirty );
+    }
     if (dev->move_serial == ReadNoFence( &dev->surface->move_serial )) return;
     if (!dev->owner_tid || dev->owner_tid == GetCurrentThreadId()) return;
     if (dev->dibdrv->clip) NtGdiSetRectRgn( dev->dibdrv->clip, 0, 0, 0, 0 );
     dc = get_physdev_dc( &dev->dev );
     InterlockedExchange( &dc->dirty, 1 );
+    TRACE_(dragtrace)( "DT drop %llu 0 hwnd %p class L\"\" hdc %p serial %d/%d\n", dragtrace_now(),
+                       dev->surface->hwnd, dc->hSelf, (int)dev->move_serial,
+                       (int)ReadNoFence( &dev->surface->move_serial ) );
 }
 
 /* gdi_lock should not be locked */

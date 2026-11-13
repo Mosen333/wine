@@ -23,6 +23,8 @@
 #include <assert.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <time.h>
 
 #include "ntstatus.h"
 #include "windef.h"
@@ -1471,6 +1473,41 @@ error:
 }
 
 
+/* WINE_SERVER_DRAGTRACE=1: log exposure, update and visible regions (bounding boxes),
+ * timestamped in microseconds of CLOCK_BOOTTIME like the client's dragtrace channel */
+static int sdt_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *str = getenv( "WINE_SERVER_DRAGTRACE" );
+        on = (str && atoi( str )) ? 1 : 0;
+    }
+    return on;
+}
+
+static unsigned long long sdt_now(void)
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_BOOTTIME, &ts );
+    return ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
+}
+
+static void sdt_region( const char *what, struct window *win, const struct region *rgn, unsigned int extra )
+{
+    struct rectangle r;
+
+    if (!sdt_on()) return;
+    if (!rgn)
+    {
+        fprintf( stderr, "DTS %llu %s win %08x none x %08x\n", sdt_now(), what, win ? win->handle : 0, extra );
+        return;
+    }
+    get_region_extents( rgn, &r );
+    fprintf( stderr, "DTS %llu %s win %08x ext (%d,%d)-(%d,%d)%s x %08x\n", sdt_now(), what, win ? win->handle : 0,
+             r.left, r.top, r.right, r.bottom, is_region_empty( rgn ) ? " empty" : "", extra );
+}
+
 /* A child window never gets a window surface of its own, it draws into the one
  * of its top-level ancestor.  That only holds while both live in the same
  * process: for a child of a foreign process update_visible_region() cannot
@@ -2161,8 +2198,10 @@ static struct region *expose_window( struct window *win, const struct rectangle 
             {
                 /* make it relative to parent */
                 offset_region( new_vis_rgn, old_window_rect->left, old_window_rect->top );
+                sdt_region( "expose-parent", win->parent, new_vis_rgn, win->handle );
                 redraw_window( win->parent, new_vis_rgn, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
             }
+            else sdt_region( "expose-parent-empty", win->parent, NULL, win->handle );
         }
     }
     free_region( new_vis_rgn );
@@ -2231,6 +2270,14 @@ static void set_window_pos( struct window *win, struct window *previous,
     if (win->parent && !is_visible( win->parent )) visible = 0;
 
     if (visible && !(old_vis_rgn = get_visible_region( win, DCX_WINDOW ))) return;
+    if (sdt_on())
+    {
+        sdt_region( "swp-oldvis", win, old_vis_rgn, swp_flags );
+        fprintf( stderr, "DTS %llu swp-rects win %08x (%d,%d)-(%d,%d) -> (%d,%d)-(%d,%d) visible %d\n", sdt_now(),
+                 win->handle, win->window_rect.left, win->window_rect.top, win->window_rect.right,
+                 win->window_rect.bottom, window_rect->left, window_rect->top, window_rect->right,
+                 window_rect->bottom, visible );
+    }
 
     /* set the new window info before invalidating anything */
 
@@ -2378,7 +2425,10 @@ static void set_window_pos( struct window *win, struct window *previous,
     }
 
     if (exposed_rgn)
+    {
+        sdt_region( "swp-exposed", win, exposed_rgn, swp_flags );
         redraw_window( win, exposed_rgn, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN, 0 );
+    }
 
     if (!is_toplevel( win ) && win->thread &&
         (client_rect->left != old_client_rect.left || client_rect->top != old_client_rect.top))
@@ -3242,6 +3292,7 @@ DECL_HANDLER(get_visible_region)
     {
         struct rectangle *data;
         map_win_region_to_screen( win, region );
+        sdt_region( "getvis", win, region, req->flags );
         data = get_region_data_and_free( region, get_reply_max_size(), &reply->total_size );
         if (data) set_reply_data_ptr( data, reply->total_size );
     }
@@ -3361,6 +3412,7 @@ DECL_HANDLER(get_update_region)
 
     reply->flags = get_window_update_flags( win, from_child, flags, &win );
     reply->child = win->handle;
+    if (reply->flags & UPDATE_PAINT) sdt_region( "getupdate", win, win->update_region, reply->flags );
 
     if (flags & UPDATE_NOREGION) return;
 

@@ -33,6 +33,7 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
+WINE_DECLARE_DEBUG_CHANNEL(dragtrace);
 
 struct dce
 {
@@ -682,6 +683,7 @@ void window_surface_flush( struct window_surface *surface )
     BITMAPINFO *color_info = (BITMAPINFO *)color_buf;
     BITMAPINFO *shape_info = (BITMAPINFO *)shape_buf;
     RECT dirty = surface->rect, bounds;
+    unsigned long long dt_start;
     void *color_bits;
 
     if (surface_flush_held( surface ))
@@ -708,9 +710,14 @@ void window_surface_flush( struct window_surface *surface )
         TRACE( "Flushing hwnd %p, surface %p %s, bounds %s, dirty %s\n", surface->hwnd, surface,
                wine_dbgstr_rect( &surface->rect ), wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ) );
 
+        dt_start = TRACE_ON(dragtrace) ? dragtrace_now() : 0;
         if (surface->funcs->flush( surface, &surface->rect, &dirty, color_info, color_bits,
                                    shape_changed, shape_info, shape_bits ))
             reset_bounds( &surface->bounds );
+        if (dt_start)
+            TRACE_(dragtrace)( "DT flush %llu %llu hwnd %p class %s dirty %s\n", dt_start,
+                               dragtrace_now() - dt_start, surface->hwnd, dragtrace_class( surface->hwnd ),
+                               wine_dbgstr_rect( &dirty ) );
     }
 
     window_surface_unlock( surface );
@@ -1437,6 +1444,9 @@ static void check_foreign_move( struct dce *dce )
 
     TRACE( "%p moved in foreign top-level %p: %s -> %s\n", dce->hwnd, top_win,
            wine_dbgstr_rect( &dce->foreign_rect ), wine_dbgstr_rect( &win_rect ) );
+    TRACE_(dragtrace)( "DT fmove %llu 0 hwnd %p class %s %s -> %s\n", dragtrace_now(), dce->hwnd,
+                       dragtrace_class( dce->hwnd ), wine_dbgstr_rect( &dce->foreign_rect ),
+                       wine_dbgstr_rect( &win_rect ) );
 
     NtGdiExtEscape( dce->hdc, NULL, 0, X11DRV_ESCAPE, sizeof(code), (char *)&code, 0, NULL );
 
@@ -2346,6 +2356,8 @@ void paint_uncovered_windows( HWND parent )
 
         if (!get_update_flags( parent, &child, &flags ) || !flags || !child) break;
         if (!is_current_thread_window( child )) break;
+        TRACE_(dragtrace)( "DT upaint %llu 0 hwnd %p class %s flags %x\n", dragtrace_now(), child,
+                           dragtrace_class( child ), flags );
         if (!paint_from_frame( child )) send_message( child, WM_PAINT, 0, 0 );
     }
 }

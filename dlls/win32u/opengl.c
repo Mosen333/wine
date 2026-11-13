@@ -38,6 +38,7 @@
 #include "dibdrv/dibdrv.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(wgl);
+WINE_DECLARE_DEBUG_CHANNEL(dragtrace);
 
 struct opengl_thread_data
 {
@@ -3239,8 +3240,14 @@ static BOOL win32u_wglSwapBuffers( HDC hdc )
     if (context) opengl_drawable_add_ref( (draw = context->draw) );
     else if (!(draw = get_window_current_drawable( hwnd ))) return FALSE;
 
-    opengl_drawable_flush( draw, interval, 0 );
-    ret = opengl_drawable_swap( draw );
+    {
+        unsigned long long dt_start = TRACE_ON(dragtrace) ? dragtrace_now() : 0;
+        opengl_drawable_flush( draw, interval, 0 );
+        ret = opengl_drawable_swap( draw );
+        if (dt_start)
+            TRACE_(dragtrace)( "DT glswap %llu %llu hwnd %p class %s\n", dt_start,
+                               dragtrace_now() - dt_start, hwnd, dragtrace_class( hwnd ) );
+    }
     opengl_drawable_release( draw );
 
     return ret;
