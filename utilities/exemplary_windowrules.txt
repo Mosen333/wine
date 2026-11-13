@@ -25,6 +25,40 @@ hl.window_rule({
 	suppress_event = "activate",
 })
 
+-- Plugin menus that are activated when shown, so Wine hands them to Hyprland:
+-- TX16Wx ("Le piglet") and iZotope (titles ending in " Popup", e.g. Ozone and its modules). Focused on hover,
+-- they took the focus and closed as soon as the pointer left them.
+hl.window_rule({
+	name = "fl-plugin-menus",
+	match = { class = "^fl64\\.exe$", title = "^(Le piglet|.* Popup)$" },
+	no_focus = true,
+	suppress_event = "activate",
+})
+
+-- FL's rename box (TNameEditForm, titled "<thing> name", e.g. "Insert 43 name", or
+-- "Rename <n> tracks" for several mixer inserts) is
+-- activated when shown, so Wine hands it to Hyprland, which focused it and took it
+-- away again on the next mouse move. Typing still reaches it through FL's window.
+hl.window_rule({
+	name = "fl-studio-rename",
+	match = { class = "^fl64\\.exe$", title = "^(.+ name|Rename .+)$", float = true },
+	no_focus = true,
+	suppress_event = "activate",
+})
+
+-- FL's other windows (plug-in windows such as Fruity Limiter opened from Patcher,
+-- floating or tiled) and its main window could request activation in turn, and with focus_on_activate
+-- Hyprland granted each request: an endless focus loop that pulled the cursor back
+-- every frame (triggered e.g. by toggling tiling repeatedly). FL's windows other
+-- than the main window don't get the focus from their own activation requests;
+-- click them instead.
+-- Emergency switch: SUPER+ALT+Q (hypr-activation-escape).
+hl.window_rule({
+	name = "fl-studio-windows-no-activate",
+	match = { class = "^fl64\\.exe$", initial_title = "negative:^FL Studio" },
+	suppress_event = "activate",
+})
+
 -- Plugin (JUCE) popup menus need no rule: the local Wine fix "winex11: Don't
 -- manage tool-window popups with a system menu that aren't activated" keeps
 -- them unmanaged, so they never take the focus. (A no_focus rule here would
@@ -45,6 +79,10 @@ end)
 -- FL's plugin picker (F8). Closing it while it has keyboard focus makes XWayland
 -- release a held mouse button, which drops a plugin being dragged out of it. It
 -- also covers the monitor, so keep it from competing with FL for full screen.
+-- Known limit: Hyprland sends no pointer input to no_focus windows, so where the
+-- picker lies over another application's window, clicks go to that window.
+-- (no_follow_mouse + no_initial_focus fixed that, but clicking an entry still
+-- focused the picker and the drag dropped early.)
 hl.window_rule({
 	name = "fl-studio-picker",
 	match = { class = "^fl64\\.exe$", title = "^PlugList$" },
@@ -64,3 +102,15 @@ hl.window_rule({
 	no_initial_focus = true,
 })
 
+-- xembedsniproxy shows Wine's and other X11 apps' tray icons in the bar's tray. Each icon sits in a
+-- small black container window that it moves under the pointer to click the icon; it asks for
+-- opacity 0, which Hyprland ignores, so the containers showed up as black squares near the bar.
+hl.window_rule({
+	name = "xembedsniproxy-containers",
+	match = { class = "^xembedsniproxy$" },
+	opacity = "0.0 override 0.0 override",
+	no_focus = true,
+	no_shadow = true,
+	no_blur = true,
+	no_anim = true,
+})
