@@ -826,8 +826,7 @@ DPI_AWARENESS_CONTEXT WINAPI SetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT
  */
 DPI_HOSTING_BEHAVIOR WINAPI GetThreadDpiHostingBehavior( void )
 {
-    FIXME("(): stub\n");
-    return DPI_HOSTING_BEHAVIOR_DEFAULT;
+    return NtUserGetThreadInfo()->dpi_hosting;
 }
 
 /**********************************************************************
@@ -835,8 +834,20 @@ DPI_HOSTING_BEHAVIOR WINAPI GetThreadDpiHostingBehavior( void )
  */
 DPI_HOSTING_BEHAVIOR WINAPI SetThreadDpiHostingBehavior( DPI_HOSTING_BEHAVIOR value )
 {
-    FIXME("(%d): stub\n", value);
-    return DPI_HOSTING_BEHAVIOR_DEFAULT;
+    struct ntuser_thread_info *info = NtUserGetThreadInfo();
+    DPI_HOSTING_BEHAVIOR prev = info->dpi_hosting;
+
+    TRACE( "(%d)\n", value );
+
+    if (value != DPI_HOSTING_BEHAVIOR_DEFAULT && value != DPI_HOSTING_BEHAVIOR_MIXED)
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return DPI_HOSTING_BEHAVIOR_INVALID;
+    }
+    /* Only the thread's behavior is kept, which is what reparenting checks below; windows don't
+     * record the behavior they were created with (GetWindowDpiHostingBehavior is still a stub). */
+    info->dpi_hosting = value;
+    return prev;
 }
 
 /***********************************************************************
