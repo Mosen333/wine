@@ -2494,8 +2494,13 @@ DECL_HANDLER(set_parent)
     if (!(win = get_window( req->handle ))) return;
     if (req->parent && !(parent = get_window( req->parent ))) return;
 
-    /* reparenting to a window with a different DPI awareness isn't allowed */
-    if (parent && !is_desktop_window( parent ) && !is_dpi_awareness_compatible( win, parent ))
+    /* reparenting to a window with a different DPI awareness isn't allowed, within a process:
+     * a window can still be embedded into another process's window, which is how plug-in
+     * bridges show an editor in their host (FL Studio's 32-bit bridge, a system aware window,
+     * into FL's per-monitor aware one: the editor stayed a separate window, could be closed
+     * on its own, and the bridge died when it was shown again). */
+    if (parent && !is_desktop_window( parent ) && win->thread && parent->thread &&
+        win->thread->process == parent->thread->process && !is_dpi_awareness_compatible( win, parent ))
         return set_error( STATUS_INVALID_STATE_TRANSITION );
 
     if (is_desktop_window(win) || is_orphan_window( win ) || (parent && is_orphan_window( parent )))
