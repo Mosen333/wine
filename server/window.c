@@ -2104,6 +2104,49 @@ static struct region *expose_window( struct window *win, const struct rectangle 
 }
 
 
+/* When a child window moves inside its top-level, its bits are assumed to move
+ * along with it: the owner copies them within its window surface, and the child
+ * is not invalidated unless it moves as part of a layout (win32u set_window_pos).
+ * A child of a foreign process has no bits in that surface, though: it paints
+ * straight into the top-level's drawable (see child_draws_from_foreign_process()),
+ * at an offset it computes when it gets its DC, and nothing tells it about the
+ * move.  FL Studio's bridged 32-bit plugin editors stayed where they were and
+ * smeared over FL when the plugin window was dragged.  Invalidate such subtrees
+ * so their process repaints them at once, which also refreshes the visible
+ * region of the DCs they paint with.
+ *
+ * A child with a pixel format (OpenGL, or a Vulkan surface for D3D) has no bits
+ * in the surface either, but win32u presents its last frame again at the new
+ * place (after_child_move()), which needs no repaint.  Invalidating those too
+ * made Kontakt 8's Qt/OpenGL editor render a frame on every step of a drag, on
+ * the host's thread; WINE_DRAGFIX_GPU_INVALIDATE=1 still does it. */
+static int gpu_invalidate_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0)
+    {
+        const char *str = getenv( "WINE_DRAGFIX_GPU_INVALIDATE" );
+        enabled = (str && atoi( str )) ? 1 : 0;
+    }
+    return enabled;
+}
+
+static void invalidate_unsurfaced_descendants( struct window *win, struct process *owner )
+{
+    struct window *child;
+
+    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
+    {
+        if (!(child->style & WS_VISIBLE)) continue;
+        if (child_draws_from_foreign_process( child, owner ) ||
+            (gpu_invalidate_enabled() && (child->paint_flags & PAINT_HAS_PIXEL_FORMAT)))
+            redraw_window( child, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN, 0 );
+        else
+            invalidate_unsurfaced_descendants( child, owner );
+    }
+}
+
 /* set the window and client rectangles, updating the update region if necessary */
 static void set_window_pos( struct window *win, struct window *previous,
                             unsigned int swp_flags, const struct rectangle *window_rect,
@@ -2270,6 +2313,10 @@ static void set_window_pos( struct window *win, struct window *previous,
 
     if (exposed_rgn)
         redraw_window( win, exposed_rgn, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN, 0 );
+
+    if (!is_toplevel( win ) && win->thread &&
+        (client_rect->left != old_client_rect.left || client_rect->top != old_client_rect.top))
+        invalidate_unsurfaced_descendants( win, win->thread->process );
 
 done:
     if (old_vis_rgn) free_region( old_vis_rgn );
