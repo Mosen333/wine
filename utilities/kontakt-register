@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Register Kontakt Player libraries in a Wine prefix / Bottles bottle, the way Native Access does.
+
+Why: Kontakt only opens a "Player" library (one that shows up in Kontakt's Libraries browser,
+from Native Instruments or a third party) if it finds the library's registry key:
+
+    HKLM\\Software\\Native Instruments\\<RegKey>
+        ContentDir   REG_SZ     <Windows path of the library folder>\\
+        HU           REG_SZ     <hex>      } decryption data for the library's encrypted
+        JDX          REG_SZ     <hex>      } resource container (.nkr) and samples (.nkx)
+        Visibility   REG_DWORD  3
+
+Native Access writes it when it installs a library. A library that was unpacked or copied by
+hand, added in a new prefix, or whose registration got lost, still appears in Kontakt, but its
+instruments load with Kontakt's plain default controls instead of the library's interface, and
+play no sound: Kontakt can't decrypt the .nkr and .nkx without HU/JDX.
+
+All four values come from the library itself: every Player library has a .nicnt file in its top
+folder (next to the Instruments and Samples folders), an XML file with <RegKey>, <HU> and <JDX>.
+This script reads them and writes the key with `wine reg`, for each library folder it is given.
+It changes nothing else, and running it again simply rewrites the same values.
+
+Usage:
+  python3 kontakt-register BOTTLE LIBRARY [LIBRARY...]     register the given libraries
+  python3 kontakt-register BOTTLE --scan FOLDER            register every library found below FOLDER
+  python3 kontakt-register BOTTLE --list                   show the registered libraries and
+                                                           whether their ContentDir still exists
+
+  BOTTLE    a Bottles bottle (its name as shown in Bottles, or its folder name), for Flatpak and
+            native Bottles, or the path of a plain Wine prefix (the folder with system.reg)
+  LIBRARY   a library's top folder (the one containing the .nicnt), or the .nicnt file itself,
+            as a normal Linux path, e.g. "/mnt/data/Kontakt/My Library"
+
+Options:
+  --scan FOLDER  look for .nicnt files up to 4 levels below FOLDER (e.g. your Kontakt libraries
+                 folder) and register all of them
+  --wine PATH    wine binary to use (default: the bottle's runner from bottle.yml, else wine in PATH)
+  --dry-run      only show which keys and values would be written
+  --list         list HKLM\\Software\\Native Instruments entries with HU/JDX and check ContentDir
+
+Notes:
+  * Close the bottle first (FL Studio, Kontakt, Native Access, ...): the script starts Wine itself,
+    and with Flatpak Bottles a Wine started outside the running sandbox can't see the running one
+    and would start a second wineserver on the same prefix. Kontakt reads these keys at startup
+    anyway, so start it again afterwards.
+  * Register the copy of a library that Kontakt should use: ContentDir points to exactly that
+    folder. If you move a library, run the script again on its new location.
+  * The library folder must be reachable from Wine. Linux paths are converted with `winepath`, so
+    they become Z:\\... (or a drive letter you mapped to that folder in winecfg/Bottles).
+  * Libraries that need online activation (commercial ones bought from Native Instruments or a
+    vendor) also need that activation in Native Access; this only restores the registry key.
+
+Examples:
+  python3 kontakt-register "FL Studio" "/mnt/data/Kontakt/Ferrum - Free Edition"
+  python3 kontakt-register "FL Studio" --scan /mnt/data/Kontakt --dry-run
+  python3 kontakt-register ~/.wine "/home/me/Kontakt Libraries/Some Library"
+"""
+
+import argparse
+import glob
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+BOTTLES_DIRS = [
+    os.path.expanduser("~/.var/app/com.usebottles.bottles/data/bottles"),
+    os.path.expanduser("~/.local/share/bottles"),
+]
+NI_KEY = "HKLM\\Software\\Native Instruments"
+
+
+def die(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ------------------------------------------------------------------ prefix and wine (as install-vcrun)
+
+
+def resolve_prefix(arg):
+    if os.path.isfile(os.path.join(os.path.expanduser(arg), "system.reg")):
+        return os.path.abspath(os.path.expanduser(arg))
+    for base in BOTTLES_DIRS:
+        for cand in glob.glob(os.path.join(base, "bottles", "*")):
+            if os.path.basename(cand) == arg or bottle_name(cand) == arg:
+                return cand
+    die(f"'{arg}' is neither a Wine prefix nor a Bottles bottle")
+
+
+def bottle_name(prefix):
+    try:
+        with open(os.path.join(prefix, "bottle.yml"), encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("Name:"):
+                    return line.split(":", 1)[1].strip().strip("'\"")
+    except OSError:
+        pass
+    return None
+
+
+def find_wine(prefix, override):
+    if override:
+        return override
+    try:
+        with open(os.path.join(prefix, "bottle.yml"), encoding="utf-8") as f:
+            runner = next((l.split(":", 1)[1].strip() for l in f if l.startswith("Runner:")), "")
+    except OSError:
+        runner = ""
+    if runner:
+        wine = os.path.join(os.path.dirname(os.path.dirname(prefix)), "runners", runner, "bin", "wine")
+        if os.path.isfile(wine):
+            return wine
+    wine = shutil.which("wine")
+    if not wine:
+        die("no wine found: pass --wine /path/to/runner/bin/wine")
+    return wine
+
+
+def prefix_running(prefix):
+    """True if a wineserver serves this prefix (its cwd is /tmp/.wine-UID/server-DEV-INODE)."""
+    st = os.stat(prefix)
+    key = f"server-{st.st_dev:x}-{st.st_ino:x}"
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            if os.path.basename(os.readlink(f"/proc/{pid}/exe")) == "wineserver" and \
+                    os.readlink(f"/proc/{pid}/cwd").endswith("/" + key):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def run_wine(wine, prefix, *args):
+    env = dict(os.environ, WINEPREFIX=prefix, WINEDEBUG="-all", WINEDLLOVERRIDES="mscoree,mshtml=")
+    return subprocess.run([wine, *args], env=env, capture_output=True, text=True, errors="replace")
+
+
+# ------------------------------------------------------------------ libraries
+
+
+def read_nicnt(path):
+    """(RegKey, HU, JDX, Name) from a .nicnt; the XML part is plain text inside the file."""
+    data = open(path, "rb").read().decode("latin-1")
+    get = lambda tag: (m.group(1).strip() if (m := re.search(rf"<{tag}>([^<]*)</{tag}>", data)) else None)
+    return get("RegKey"), get("HU"), get("JDX"), get("Name") or get("RegKey")
+
+
+def library_nicnt(arg):
+    """The .nicnt of a library folder (or the .nicnt given directly), or None."""
+    if arg.lower().endswith(".nicnt") and os.path.isfile(arg):
+        return arg
+    found = sorted(glob.glob(os.path.join(glob.escape(arg), "*.nicnt")))
+    return found[0] if found else None
+
+
+def scan(folder, depth=4):
+    found = []
+    for root, dirs, files in os.walk(folder):
+        if root[len(folder):].count(os.sep) >= depth:
+            dirs[:] = []
+        found += [os.path.join(root, f) for f in files if f.lower().endswith(".nicnt")]
+    return sorted(found)
+
+
+def to_windows(wine, prefix, path):
+    res = run_wine(wine, prefix, "winepath", "-w", path)
+    win = res.stdout.strip().splitlines()[-1] if res.returncode == 0 and res.stdout.strip() else ""
+    if not win:
+        win = "Z:" + os.path.abspath(path).replace("/", "\\")
+    return win.rstrip("\\") + "\\"
+
+
+def register(wine, prefix, nicnt, dry):
+    regkey, hu, jdx, name = read_nicnt(nicnt)
+    if not (regkey and hu and jdx):
+        print(f"skip {nicnt}: no RegKey/HU/JDX in it (not a Player library?)")
+        return False
+    content_dir = to_windows(wine, prefix, os.path.dirname(os.path.abspath(nicnt)))
+    key = f"{NI_KEY}\\{regkey}"
+    values = [("ContentDir", "REG_SZ", content_dir), ("HU", "REG_SZ", hu),
+              ("JDX", "REG_SZ", jdx), ("Visibility", "REG_DWORD", "3")]
+    print(f"{name}\n    {key}")
+    for value, kind, data in values:
+        print(f"    {value} = {data}")
+        if dry:
+            continue
+        # both registry views: 64-bit Kontakt reads the 64-bit one, a 32-bit Kontakt the other
+        for view in ("/reg:64", "/reg:32"):
+            res = run_wine(wine, prefix, "reg", "add", key, "/v", value, "/t", kind, "/d", data, "/f", view)
+            if res.returncode != 0:
+                die(f"reg add failed for {key}\\{value}: {res.stderr.strip() or res.stdout.strip()}")
+    return True
+
+
+def list_registered(wine, prefix):
+    res = run_wine(wine, prefix, "reg", "query", NI_KEY, "/s", "/reg:64")
+    if res.returncode != 0:
+        die(f"reg query failed: {res.stderr.strip() or res.stdout.strip()}")
+    entries, cur = {}, None
+    for line in res.stdout.splitlines():
+        if line.startswith("HKEY_"):
+            cur = line.split("\\Native Instruments\\", 1)[-1] if "\\Native Instruments\\" in line else None
+            if cur:
+                entries.setdefault(cur, {})
+        elif cur and line.strip():
+            parts = line.split(None, 2)
+            if len(parts) == 3:
+                entries[cur][parts[0]] = parts[2]
+    libs = {k: v for k, v in entries.items() if "HU" in v and "JDX" in v}
+    if not libs:
+        print("no Player libraries registered")
+    for name in sorted(libs, key=str.lower):
+        cdir = libs[name].get("ContentDir", "")
+        unix = run_wine(wine, prefix, "winepath", "-u", cdir).stdout.strip() if cdir else ""
+        state = "ok" if unix and os.path.isdir(unix) else "MISSING"
+        print(f"{state:8} {name}\n         {cdir}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Register Kontakt Player libraries (see the top of this file).")
+    ap.add_argument("bottle", help="Bottles bottle name/folder or Wine prefix path")
+    ap.add_argument("libraries", nargs="*", help="library folders (with the .nicnt) or .nicnt files")
+    ap.add_argument("--scan", metavar="FOLDER", help="register every library found below FOLDER")
+    ap.add_argument("--wine", help="wine binary (default: the bottle's runner, else wine in PATH)")
+    ap.add_argument("--dry-run", action="store_true", help="only show what would be written")
+    ap.add_argument("--list", action="store_true", help="list registered libraries")
+    args = ap.parse_args()
+
+    prefix = resolve_prefix(args.bottle)
+    # a wineserver lingers for a few seconds after its last program (e.g. a previous run of this)
+    for _ in range(15):
+        if not prefix_running(prefix):
+            break
+        time.sleep(1)
+    if prefix_running(prefix):
+        die("the bottle is running: close FL Studio/Kontakt/Native Access (and wait until the bottle "
+            "has stopped), then run this again")
+    wine = find_wine(prefix, args.wine)
+    print(f"prefix {prefix}\nwine   {wine}\n")
+
+    if args.list:
+        list_registered(wine, prefix)
+        return
+
+    nicnts = []
+    for lib in args.libraries:
+        nicnt = library_nicnt(os.path.expanduser(lib))
+        if nicnt:
+            nicnts.append(nicnt)
+        else:
+            print(f"skip {lib}: no .nicnt file in it (pass the library's top folder)")
+    if args.scan:
+        nicnts += scan(os.path.abspath(os.path.expanduser(args.scan)))
+    if not nicnts:
+        die("no libraries given: pass library folders, --scan FOLDER or --list")
+
+    done = sum(register(wine, prefix, n, args.dry_run) for n in nicnts)
+    print(f"\n{'would register' if args.dry_run else 'registered'} {done} of {len(nicnts)} libraries"
+          + ("" if args.dry_run else "; restart Kontakt (or the host) to use them"))
+
+
+main()
