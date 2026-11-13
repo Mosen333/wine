@@ -335,7 +335,7 @@
 # @ stub CreateSymbolicLinkTransactedW
 @ stdcall -import CreateSymbolicLinkW(wstr wstr long)
 @ stdcall CreateTapePartition(long long long long)
-@ stdcall -import CreateThread(ptr long ptr long long ptr)
+@ stdcall CreateThread(ptr long ptr long long ptr) KERNEL32_CreateThread
 @ stdcall -import CreateThreadpool(ptr)
 @ stdcall -import CreateThreadpoolCleanupGroup()
 @ stdcall -import CreateThreadpoolIo(ptr ptr ptr ptr)

@@ -122,6 +122,22 @@ BOOL WINAPI GetThreadSelectorEntry( HANDLE thread, DWORD sel, LDT_ENTRY *ldtent 
 
 
 /***********************************************************************
+ *           CreateThread   (KERNEL32.@)
+ *
+ * A function of our own rather than an import thunk into kernelbase: a thunk starts with
+ * an rip-relative jmp, and hooking libraries that copy a function's first instructions to a
+ * trampoline (the copy protection of Soundtoys 5's plug-ins hooks CreateThread) copy it
+ * unchanged, so the trampoline jumped through whatever lay next to it in the heap.  Like
+ * Windows' kernel32 stub, it only passes the call on.
+ */
+HANDLE WINAPI DECLSPEC_HOTPATCH __attribute__((optimize("no-optimize-sibling-calls")))
+KERNEL32_CreateThread( SECURITY_ATTRIBUTES *sa, SIZE_T stack, LPTHREAD_START_ROUTINE start,
+                       void *param, DWORD flags, DWORD *id )
+{
+    return CreateRemoteThreadEx( GetCurrentProcess(), sa, stack, start, param, flags, NULL, id );
+}
+
+/***********************************************************************
  * GetCurrentThread [KERNEL32.@]  Gets pseudohandle for current thread
  *
  * RETURNS
