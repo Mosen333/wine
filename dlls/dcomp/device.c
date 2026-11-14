@@ -6108,6 +6108,27 @@ static BOOL dcomp_stack_above(const HWND *pa, unsigned int na, const HWND *pb, u
     return FALSE;
 }
 
+/* Does GDI already keep the window of path b off the window of path a above it?
+ * The server clips a sibling above an ancestor out of a visible region when
+ * that ancestor has WS_CLIPSIBLINGS, unless the sibling is WS_EX_TRANSPARENT
+ * (get_visible_region(), clip_children()); the whole branch of a lies inside
+ * that sibling.  Then the stack clip has nothing to add -- and being refreshed
+ * only every DCOMP_STACK_REFRESH_MS it would cut out where the upper window
+ * was until a moment ago: FL Studio's plugin windows are such siblings, and a
+ * Serum 2 under another one, dragged away, never got the uncovered strips
+ * back, its WM_PAINT validated with nothing delivered there. */
+static BOOL dcomp_stack_gdi_clips(const HWND *pa, unsigned int na, const HWND *pb, unsigned int nb)
+{
+    unsigned int i = 0;
+
+    while (i < na && i < nb && pa[i] == pb[i])
+        i++;
+    if (!i || i == na || i == nb)
+        return FALSE;
+    return (GetWindowLongW(pb[i], GWL_STYLE) & WS_CLIPSIBLINGS)
+            && !(GetWindowLongW(pa[i], GWL_EXSTYLE) & WS_EX_TRANSPARENT);
+}
+
 /* Recompute the paths, screen rectangles and the stack clip of every target.
  * Caller holds dcomp_all_targets_cs. */
 static void dcomp_stack_refresh(void)
@@ -6163,6 +6184,8 @@ static void dcomp_stack_refresh(void)
             if (!IntersectRect(&r, &u->stack_rect, &t->stack_rect))
                 continue;
             if (!dcomp_stack_above(u->stack_path, u->stack_depth, t->stack_path, t->stack_depth))
+                continue;
+            if (dcomp_stack_gdi_clips(u->stack_path, u->stack_depth, t->stack_path, t->stack_depth))
                 continue;
             OffsetRect(&r, -t->stack_rect.left, -t->stack_rect.top);
             if (!t->stack_clip)
@@ -8166,6 +8189,7 @@ static void dcomp_target_animation_tick(struct dcomp_target *target)
 /* Phase 5: WndProc subclass — suppresses WM_ERASEBKGND to prevent white-on-open.
  * WM_PAINT is forwarded to the original WndProc so that VSTGUI can call
  * BeginDraw → Render → EndDraw → Commit in response to paint requests. */
+
 static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     struct dcomp_target *target = (struct dcomp_target *)GetPropW(hwnd, dcomp_target_prop);
