@@ -546,6 +546,8 @@ void repaint_gdi_children( HWND hwnd )
  * client surfaces below the window again (WINE_DRAGFIX_REPRESENT=0 disables). */
 static void after_child_move( HWND hwnd )
 {
+    static const WCHAR child_move_tick_prop[] =
+        {'_','_','w','i','n','e','_','c','h','i','l','d','_','m','o','v','e','_','t','i','c','k',0};
     static int flush_ms = -1, represent = -1, repaint = -1, updatenow = -1;
     static DWORD last_flush;
     DWORD now;
@@ -563,6 +565,11 @@ static void after_child_move( HWND hwnd )
         updatenow = str ? atoi( str ) : 1;
     }
 
+    /* tell the DirectComposition emulation that windows are being moved here, so
+     * it answers the WM_PAINTs this brings from the composed frame (dcomp,
+     * dcomp_target_paint_from_frame()) and leaves the application's own alone */
+    NtUserSetProp( NtUserGetAncestor( hwnd, GA_ROOT ), child_move_tick_prop,
+                   ULongToHandle( NtGetTickCount() | 1 ));
     if (updatenow) paint_uncovered_windows( NtUserGetAncestor( hwnd, GA_PARENT ) );
 
     /* once the moves stop: timer messages come after input and paints, so it
