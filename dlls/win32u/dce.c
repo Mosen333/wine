@@ -1939,6 +1939,45 @@ static BOOL send_erase( HWND hwnd, UINT flags, HRGN client_rgn,
  *
  * Move the window bits when a window is resized, or moved within a parent window.
  */
+/* The bits of a moved window are copied except where its update region is,
+ * which is going to be repainted anyway.  For a window without WS_CLIPCHILDREN
+ * that region also covers its child windows, though, and they are not going to
+ * be repainted: their own update regions are empty.  FL Studio's plugin windows
+ * are such windows, invalidated all the time while they are dragged, and the
+ * plugin editor inside was left out of the copy: its old pixels stayed at the
+ * new place, shifted by the step of the drag, and the parts of a VSTGUI editor
+ * that do not change were never painted again.  Keep the visible children out
+ * of the excluded region (WINE_DRAGFIX_COPYCHILDREN=0 restores the old way);
+ * a child that is invalid itself repaints over what the copy put there. */
+static void exclude_children_from_update( HWND hwnd, HRGN rgn )
+{
+    static int enabled = -1;
+    HWND *list;
+    int i;
+
+    if (enabled < 0)
+    {
+        const char *str = getenv( "WINE_DRAGFIX_COPYCHILDREN" );
+        enabled = str ? atoi( str ) : 1;
+    }
+    if (!enabled || !rgn) return;
+    if (get_window_long( hwnd, GWL_STYLE ) & WS_CLIPCHILDREN) return;
+    if (!(list = list_window_children( hwnd ))) return;
+
+    for (i = 0; list[i]; i++)
+    {
+        struct window_rects rects;
+        HRGN child;
+
+        if (!(get_window_long( list[i], GWL_STYLE ) & WS_VISIBLE)) continue;
+        if (!get_window_rects( list[i], COORDS_SCREEN, &rects, get_thread_dpi() )) continue;
+        child = NtGdiCreateRectRgn( rects.window.left, rects.window.top, rects.window.right, rects.window.bottom );
+        NtGdiCombineRgn( rgn, rgn, child, RGN_DIFF );
+        NtGdiDeleteObjectApp( child );
+    }
+    free( list );
+}
+
 void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *valid_rects )
 {
     RECT dst = valid_rects[0], src = valid_rects[1];
@@ -1948,7 +1987,10 @@ void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *
     {
         UINT flags = UPDATE_NOCHILDREN | UPDATE_CLIPCHILDREN;
         HRGN rgn = get_update_region( hwnd, &flags, NULL );
-        HDC hdc = NtUserGetDCEx( hwnd, rgn, DCX_CACHE | DCX_WINDOW | DCX_EXCLUDERGN );
+        HDC hdc;
+
+        exclude_children_from_update( hwnd, rgn );
+        hdc = NtUserGetDCEx( hwnd, rgn, DCX_CACHE | DCX_WINDOW | DCX_EXCLUDERGN );
 
         TRACE( "copying %s -> %s\n", wine_dbgstr_rect( &src ), wine_dbgstr_rect( &dst ));
         OffsetRect( &src, -rects->window.left, -rects->window.top );
