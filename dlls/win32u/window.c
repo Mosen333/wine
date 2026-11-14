@@ -2605,6 +2605,20 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     if (ret)
     {
         update_surface_region( surface_win );
+        /* drawing of other threads with a DC taken before this is dropped, see
+         * check_surface_moved() in dibdrv */
+        if (is_child && surface_win &&
+            (!EqualRect( &old_rects.window, &new_rects->window ) || !(swp_flags & SWP_NOZORDER) ||
+             (swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW))))
+        {
+            WND *top = get_win_ptr( surface_win );
+
+            if (top && top != WND_DESKTOP && top != WND_OTHER_PROCESS)
+            {
+                if (top->surface) InterlockedIncrement( &top->surface->move_serial );
+                release_win_ptr( top );
+            }
+        }
         /* A child drawn by another process is subtracted from its top-level's
          * surface region (server, clip_pixel_format_children), so the owner's
          * flush keeps off the pixels the child paints into the shared drawable.
