@@ -35,6 +35,7 @@
 enum system_timer_id
 {
     SYSTEM_TIMER_TRACK_MOUSE = 0xfffa,
+    SYSTEM_TIMER_MOVE_REPAINT = 0xfff9,
     SYSTEM_TIMER_CARET = 0xffff,
 };
 
