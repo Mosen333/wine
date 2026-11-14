@@ -4100,6 +4100,11 @@ LRESULT WINAPI NtUserDispatchMessage( const MSG *msg )
             case SYSTEM_TIMER_TRACK_MOUSE:
                 update_mouse_tracking_info( msg->hwnd );
                 return 0;
+
+            case SYSTEM_TIMER_MOVE_REPAINT:
+                NtUserKillSystemTimer( msg->hwnd, SYSTEM_TIMER_MOVE_REPAINT );
+                repaint_gdi_children( msg->hwnd );
+                return 0;
         }
     }
 

@@ -505,6 +505,36 @@ static void represent_client_surfaces( HWND hwnd )
     }
 }
 
+/* Invalidate hwnd and everything below it that paints through GDI, but not windows
+ * with a client surface (those present their last frame again, see above): FL
+ * Studio's plugin windows, moved on their own, keep their bits only through the
+ * copy of the move, and with editors that redraw only what changed (VSTGUI)
+ * whatever the copy got wrong stayed wrong.  Done once the moves stop (system
+ * timer, see after_child_move()): invalidated on every move, the dragged window
+ * always came first among the windows to paint and the ones it uncovered got no
+ * paint at all while it was dragged.  No RDW_ERASE: the erase would reach the
+ * screen before the repaint (the flashing 928450ff8e1 removed). */
+void repaint_gdi_children( HWND hwnd )
+{
+    HWND *list;
+    WND *win;
+    int i;
+
+    if ((win = get_win_ptr( hwnd )) && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
+    {
+        BOOL gpu = win->clip_clients || win->present_offscreen;
+        release_win_ptr( win );
+        if (gpu) return;
+    }
+    else return;  /* another process: the server takes care of those */
+
+    NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_NOCHILDREN );
+    if (!(list = list_window_children( hwnd ))) return;
+    for (i = 0; list[i]; i++)
+        if (get_window_long( list[i], GWL_STYLE ) & WS_VISIBLE) repaint_gdi_children( list[i] );
+    free( list );
+}
+
 /* A child window moved on its own inside its top-level (FL Studio's plugin windows
  * while they are dragged).  Its bits were copied within the top-level's window
  * surface, but that surface reaches the screen only when the thread goes idle, or
@@ -516,7 +546,7 @@ static void represent_client_surfaces( HWND hwnd )
  * client surfaces below the window again (WINE_DRAGFIX_REPRESENT=0 disables). */
 static void after_child_move( HWND hwnd )
 {
-    static int flush_ms = -1, represent = -1;
+    static int flush_ms = -1, represent = -1, repaint = -1;
     static DWORD last_flush;
     DWORD now;
     WND *win;
@@ -527,8 +557,13 @@ static void after_child_move( HWND hwnd )
         flush_ms = str ? atoi( str ) : 8;
         str = getenv( "WINE_DRAGFIX_REPRESENT" );
         represent = str ? atoi( str ) : 1;
+        str = getenv( "WINE_DRAGFIX_REPAINT" );
+        repaint = str ? atoi( str ) : 1;
     }
 
+    /* once the moves stop: timer messages come after input and paints, so it
+     * fires when the mouse rests and takes no paint away from the windows below */
+    if (repaint) NtUserSetSystemTimer( hwnd, SYSTEM_TIMER_MOVE_REPAINT, repaint > 1 ? repaint : 60 );
     if (represent) represent_client_surfaces( hwnd );
 
     if (flush_ms <= 0) return;
