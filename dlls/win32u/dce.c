@@ -967,10 +967,20 @@ static void update_visible_region( struct dce *dce )
     DWORD paint_flags = 0;
     size_t size = 256;
     RECT win_rect, top_rect;
+    struct window_surface *serial_surface = NULL;
+    LONG move_serial = 0;
     WND *win;
 
     /* don't clip siblings if using parent clip region */
     if (flags & DCX_PARENTCLIP) flags &= ~DCX_CLIPSIBLINGS;
+
+    /* taken before the region, so that a move after it is seen, see lock_surface() */
+    win = get_win_ptr( NtUserGetAncestor( dce->hwnd, GA_ROOT ) );
+    if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
+    {
+        if ((serial_surface = win->surface)) move_serial = ReadNoFence( &serial_surface->move_serial );
+        release_win_ptr( win );
+    }
 
     /* fetch the visible region from the server */
     do
@@ -1033,7 +1043,10 @@ static void update_visible_region( struct dce *dce )
     }
 
     if (!surface) SetRectEmpty( &top_rect );
-    set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface );
+    /* only a pointer comparison: bound to another surface, take that one's serial */
+    if (surface != serial_surface) move_serial = surface ? ReadNoFence( &surface->move_serial ) : 0;
+    set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface, move_serial,
+                        get_window_thread( dce->hwnd, NULL ) );
     if (surface) window_surface_release( surface );
 }
 
@@ -1044,7 +1057,7 @@ static void release_dce( struct dce *dce )
 {
     if (!dce->hwnd) return;  /* already released */
 
-    set_visible_region( dce->hdc, 0, &dummy_surface.rect, &dummy_surface.rect, &dummy_surface );
+    set_visible_region( dce->hdc, 0, &dummy_surface.rect, &dummy_surface.rect, &dummy_surface, 0, 0 );
     user_driver->pReleaseDC( dce->hwnd, dce->hdc );
 
     if (dce->clip_rgn) NtGdiDeleteObjectApp( dce->clip_rgn );

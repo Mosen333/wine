@@ -504,6 +504,8 @@ struct windrv_physdev
     struct dibdrv_physdev *dibdrv;
     struct window_surface *surface;
     UINT lock_count;
+    LONG move_serial;   /* surface->move_serial when the DC's visible region was taken */
+    DWORD owner_tid;    /* thread of the DC's window */
 };
 
 static const struct gdi_dc_funcs window_driver;
@@ -511,6 +513,33 @@ static const struct gdi_dc_funcs window_driver;
 static inline struct windrv_physdev *get_windrv_physdev( PHYSDEV dev )
 {
     return (struct windrv_physdev *)dev;
+}
+
+/* A thread that draws into a window it does not own - wined3d's command stream
+ * thread presenting a swap chain through the DC it took when the swap chain was
+ * created, for one - races with the owner moving windows inside the top-level.
+ * The DC's offset and clipping were taken before the move: invalidate_dce()
+ * only marks it dirty for its next use, and set_visible_region() clears that
+ * mark even when it was set while the region was being fetched.  Drawing with
+ * it puts the window where it was, over whatever the owner has repainted there
+ * since (in FL Studio, a Direct2D plugin editor painted over the plugin frame
+ * beside it, or one under another plugin window painted over that window's
+ * caption), and nothing repaints that again.
+ *
+ * Each child move inside a top-level bumps surface->move_serial; a DC remembers
+ * the value from before its visible region was taken.  If it changed, drop the
+ * drawing (empty clip) and have the DC fetched again: the move has copied the
+ * window's previous picture to its new place, and the next frame lands right.
+ * The owner thread cannot race with its own moves, so its drawing is left alone. */
+static void check_surface_moved( struct windrv_physdev *dev )
+{
+    DC *dc;
+
+    if (dev->move_serial == ReadNoFence( &dev->surface->move_serial )) return;
+    if (!dev->owner_tid || dev->owner_tid == GetCurrentThreadId()) return;
+    if (dev->dibdrv->clip) NtGdiSetRectRgn( dev->dibdrv->clip, 0, 0, 0, 0 );
+    dc = get_physdev_dc( &dev->dev );
+    InterlockedExchange( &dc->dirty, 1 );
 }
 
 /* gdi_lock should not be locked */
@@ -521,6 +550,7 @@ static inline void lock_surface( struct windrv_physdev *dev )
     if (!dev->lock_count++)
     {
         window_surface_lock( surface );
+        check_surface_moved( dev );
         if (IsRectEmpty( dev->dibdrv->bounds ) || !surface->draw_start_ticks)
             surface->draw_start_ticks = NtGetTickCount();
     }
@@ -557,7 +587,7 @@ static void unlock_windrv_bits( struct gdi_image_bits *bits )
     unlock_surface( bits->param );
 }
 
-void dibdrv_set_window_surface( DC *dc, struct window_surface *surface )
+void dibdrv_set_window_surface( DC *dc, struct window_surface *surface, LONG move_serial, DWORD owner_tid )
 {
     PHYSDEV windev;
     struct windrv_physdev *physdev;
@@ -582,6 +612,8 @@ void dibdrv_set_window_surface( DC *dc, struct window_surface *surface )
         window_surface_add_ref( surface );
         if (physdev->surface) window_surface_release( physdev->surface );
         physdev->surface = surface;
+        physdev->move_serial = move_serial;
+        physdev->owner_tid = owner_tid;
 
         dibdrv = physdev->dibdrv;
         if (!(bmp = GDI_GetObjPtr( surface->color_bitmap, NTGDI_OBJ_BITMAP )))

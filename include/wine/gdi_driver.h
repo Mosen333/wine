@@ -331,6 +331,7 @@ struct window_surface
     HRGN                               shape_region; /* shape of the window surface, unshaped if 0 */
     HBITMAP                            shape_bitmap; /* bitmap for the surface shape (1bpp) */
     HBITMAP                            color_bitmap; /* bitmap for the surface colors */
+    LONG                               move_serial;  /* bumped when a child window inside moves, no locking */
     /* driver-specific fields here */
 };
 
