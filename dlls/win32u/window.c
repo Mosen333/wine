@@ -546,7 +546,7 @@ void repaint_gdi_children( HWND hwnd )
  * client surfaces below the window again (WINE_DRAGFIX_REPRESENT=0 disables). */
 static void after_child_move( HWND hwnd )
 {
-    static int flush_ms = -1, represent = -1, repaint = -1;
+    static int flush_ms = -1, represent = -1, repaint = -1, updatenow = -1;
     static DWORD last_flush;
     DWORD now;
     WND *win;
@@ -559,7 +559,11 @@ static void after_child_move( HWND hwnd )
         represent = str ? atoi( str ) : 1;
         str = getenv( "WINE_DRAGFIX_REPAINT" );
         repaint = str ? atoi( str ) : 1;
+        str = getenv( "WINE_DRAGFIX_UPDATENOW" );
+        updatenow = str ? atoi( str ) : 1;
     }
+
+    if (updatenow) paint_uncovered_windows( NtUserGetAncestor( hwnd, GA_PARENT ) );
 
     /* once the moves stop: timer messages come after input and paints, so it
      * fires when the mouse rests and takes no paint away from the windows below */

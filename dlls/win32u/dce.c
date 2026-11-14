@@ -2201,6 +2201,29 @@ static void update_now( HWND hwnd, UINT rdw_flags )
     }
 }
 
+/* Paint the windows below parent that a moved child uncovered (or that are
+ * otherwise waiting for a paint), now and in this thread, before the next mouse
+ * move is handled.  A paint waits until no input is queued, and while a window
+ * is dragged with a mouse sending 1000 events a second there is always input:
+ * in FL Studio the plugin windows under a dragged one were repainted only after
+ * the drag, and every step left a trail of the dragged window behind.  Bounded,
+ * and only windows of this thread: a window that invalidates itself while it
+ * paints, or one of another process, must not hold up the drag. */
+void paint_uncovered_windows( HWND parent )
+{
+    HWND child = 0;
+    int i;
+
+    for (i = 0; i < 32; i++)
+    {
+        UINT flags = UPDATE_PAINT | UPDATE_INTERNALPAINT | UPDATE_ALLCHILDREN;
+
+        if (!get_update_flags( parent, &child, &flags ) || !flags || !child) break;
+        if (!is_current_thread_window( child )) break;
+        send_message( child, WM_PAINT, 0, 0 );
+    }
+}
+
 /***********************************************************************
  *           NtUserRedrawWindow (win32u.@)
  */
