@@ -81,13 +81,13 @@
 |                                                                            |
 |  FROM SOURCE                                                               |
 |    $ git clone https://github.com/Mosen333/wine.git && cd wine             |
-|    $ git checkout d2d1-dcomp-11.22-plugins                                 |
+|    $ git checkout d2d1-dcomp-11.22-plugins-hyprland                        |
 |    $ ./configure --prefix=/opt/wine-d2d1 --enable-archs=i386,x86_64        |
 |    $ make -j$(nproc)                                                       |
 |    $ sudo make install DESTDIR=/your/directory                             |
 |                                                                            |
-|  d2d1-dcomp-11.22-plugins is the main branch; on Hyprland, check out       |
-|  d2d1-dcomp-11.22-plugins-hyprland instead.                                |
+|  d2d1-dcomp-11.22-plugins-hyprland is the branch for Hyprland; on any      |
+|  other desktop, check out d2d1-dcomp-11.22-plugins instead.                |
 |                                                                            |
 |  The opt directory in the destination directory holds the Wine runner      |
 |  folder, which can be copied to wherever a prefix manager such as          |
