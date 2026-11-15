@@ -3862,9 +3862,9 @@ struct dcomp_target
     HRGN stack_clip;                      /* client-space area the targets above have on screen */
     struct dcomp_hud hud;                 /* WINE_DCOMP_HUD overlay (issue 399), unused without the variable */
     /* WM_PAINT bursts answered from the composed frame, see dcomp_target_paint_from_frame() */
-    DWORD paint_tick;                     /* GetTickCount of the last WM_PAINT */
-    DWORD paint_app_tick;                 /* ... of the last one the application answered */
+    DWORD paint_app_tick;                 /* GetTickCount of the last WM_PAINT the application answered */
     HRGN paint_deferred;                  /* what it has not been asked to repaint since */
+    DWORD paint_defer_tick;               /* GetTickCount when paint_deferred started */
     BOOL paint_app_next;                  /* the next WM_PAINT goes to the application */
     /* WndProc subclass for WM_ERASEBKGND / WM_PAINT protection (Phase 5) */
     WNDPROC orig_wndproc;
@@ -8242,24 +8242,22 @@ static BOOL dcomp_target_restore_frame(struct dcomp_target *target, HWND hwnd, R
  * composition surface may well redraw much more than was asked: Serum 2
  * (VSTGUI) re-rendered 1190x367 for a strip 3 pixels wide, 20 to 90 ms each,
  * and a plugin window dragged over it in FL Studio uncovered such a strip on
- * every step.  Answer the WM_PAINTs of a burst from the composed frame instead:
- * the first one after a quiet spell still goes to the application, and so does
- * one every DCOMP_PAINT_APP_MS during a long burst; what was answered from the
- * frame is invalidated for the application once the burst is over
- * (DCOMP_PAINT_TIMER).  Only while windows are being moved inside the
- * top-level (win32u stamps "__wine_child_move_tick" on it for every child move):
- * Serum 2 also animates its wavetables and envelopes through WM_PAINT, in bursts
- * just the same, and those must reach it at once.
+ * every step.  While windows are being moved inside the top-level (win32u
+ * stamps "__wine_child_move_tick" on it for every child move), answer them from
+ * the composed frame instead, and let the application repaint all it was spared
+ * once the moves stop (DCOMP_PAINT_TIMER), or once a second during a long drag.
+ * Letting the first WM_PAINT of each burst through still cost 60 ms a burst,
+ * most of a drag over a Serum 2.  Only during moves: Serum 2 also animates its
+ * wavetables and envelopes through WM_PAINT, and those must reach it at once.
  * WINE_DCOMP_PAINT_FROM_FRAME=0 turns it off. */
 #define DCOMP_PAINT_MOVE_MS  150
-#define DCOMP_PAINT_BURST_MS 200
-#define DCOMP_PAINT_APP_MS   500
+#define DCOMP_PAINT_APP_MS   1000
 #define DCOMP_PAINT_LATER_MS 120
 
 static BOOL dcomp_target_paint_from_frame(struct dcomp_target *target, HWND hwnd)
 {
     static int enabled = -1;
-    DWORD now = GetTickCount(), last = target->paint_tick, moved;
+    DWORD now = GetTickCount(), moved;
     PAINTSTRUCT ps;
     RECT update;
     HRGN rgn;
@@ -8269,10 +8267,12 @@ static BOOL dcomp_target_paint_from_frame(struct dcomp_target *target, HWND hwnd
         const char *e = getenv("WINE_DCOMP_PAINT_FROM_FRAME");
         enabled = (!e || atoi(e)) ? 1 : 0;
     }
-    target->paint_tick = now;
     moved = HandleToULong(GetPropW(GetAncestor(hwnd, GA_ROOT), L"__wine_child_move_tick"));
-    if (!enabled || target->paint_app_next || !last || !moved || now - moved >= DCOMP_PAINT_MOVE_MS
-            || now - last >= DCOMP_PAINT_BURST_MS || now - target->paint_app_tick >= DCOMP_PAINT_APP_MS)
+    if (!enabled || target->paint_app_next || !moved || now - moved >= DCOMP_PAINT_MOVE_MS)
+        goto app;
+    /* a long drag: let the application draw once a second all the same */
+    if (target->paint_deferred && now - target->paint_defer_tick >= DCOMP_PAINT_APP_MS
+            && now - target->paint_app_tick >= DCOMP_PAINT_APP_MS)
         goto app;
     if (!GetUpdateRect(hwnd, &update, FALSE) || !(rgn = CreateRectRgn(0, 0, 0, 0)))
         goto app;
@@ -8287,7 +8287,10 @@ static BOOL dcomp_target_paint_from_frame(struct dcomp_target *target, HWND hwnd
         goto app;
     }
     if (!target->paint_deferred)
+    {
         target->paint_deferred = rgn;
+        target->paint_defer_tick = now;
+    }
     else
     {
         CombineRgn(target->paint_deferred, target->paint_deferred, rgn, RGN_OR);
