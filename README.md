@@ -131,7 +131,7 @@ pwrshsip (new) · powershell.exe · winemenubuilder.exe · and more than twenty 
 ```bash
 git clone https://github.com/Mosen333/wine.git
 cd wine
-git checkout d2d1-dcomp-11.21-plugins    # the main branch; d2d1-dcomp-11.21-plugins-hyprland for hyprland users
+git checkout d2d1-dcomp-11.21-plugins-hyprland    # the hyprland branch; use d2d1-dcomp-11.21-plugins else
 ./configure --prefix=/opt/wine-d2d1 --enable-archs=i386,x86_64
 make -j$(nproc)
 sudo make install DESTDIR=/your/directory
