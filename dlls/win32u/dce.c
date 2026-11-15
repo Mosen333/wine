@@ -2201,6 +2201,65 @@ static void update_now( HWND hwnd, UINT rdw_flags )
     }
 }
 
+/* Answer a WM_PAINT of a window that a D3D swap chain presents into from the
+ * frame wined3d keeps for it, while windows are being moved in its top-level.
+ * wined3d publishes that frame as "__wine_dcomp_comp_dc" (swapchain_blit_gdi());
+ * a window with a composition subclass of dxgi or dcomp answers its WM_PAINT
+ * itself and is left alone.  HG-2MS (VSTGUI over Direct2D) re-rendered 13 to
+ * 77 ms for every strip a plugin window dragged over it in FL Studio uncovered,
+ * which made the drag stall.  As the DWM would, show the last frame instead and
+ * let the application repaint once the moves stop (SYSTEM_TIMER_MOVE_REPAINT,
+ * repaint_gdi_children()), or once a second during a long drag.  The move stamp
+ * is the one after_child_move() leaves on the top-level.
+ * WINE_DRAGFIX_SWAPCHAIN_FRAME=0 turns it off. */
+BOOL paint_from_swapchain_frame( HWND hwnd )
+{
+    static const WCHAR comp_dc_prop[] = {'_','_','w','i','n','e','_','d','c','o','m','p','_','c','o','m','p','_','d','c',0};
+    static const WCHAR comp_size_prop[] = {'_','_','w','i','n','e','_','d','c','o','m','p','_','c','o','m','p','_','s','i','z','e',0};
+    static const WCHAR subclass_prop[] = {'_','_','w','i','n','e','_','d','c','o','m','p','_','s','u','b','c','l','a','s','s','_','p','r','o','c',0};
+    static const WCHAR move_tick_prop[] = {'_','_','w','i','n','e','_','c','h','i','l','d','_','m','o','v','e','_','t','i','c','k',0};
+    static const WCHAR defer_tick_prop[] = {'_','_','w','i','n','e','_','p','a','i','n','t','_','d','e','f','e','r','_','t','i','c','k',0};
+    static const WCHAR app_tick_prop[] = {'_','_','w','i','n','e','_','p','a','i','n','t','_','a','p','p','_','t','i','c','k',0};
+    static int enabled = -1;
+    DWORD now, moved, defer, size;
+    PAINTSTRUCT ps;
+    HDC comp, hdc;
+
+    if (enabled < 0)
+    {
+        const char *str = getenv( "WINE_DRAGFIX_SWAPCHAIN_FRAME" );
+        enabled = str ? atoi( str ) : 1;
+    }
+    if (!enabled || !is_current_thread_window( hwnd )) return FALSE;
+    if (!(comp = NtUserGetProp( hwnd, comp_dc_prop )) || NtUserGetProp( hwnd, subclass_prop )) return FALSE;
+    now = NtGetTickCount();
+    moved = HandleToULong( NtUserGetProp( NtUserGetAncestor( hwnd, GA_ROOT ), move_tick_prop ));
+    if (!moved || now - moved >= 150) return FALSE;
+    if (!(defer = HandleToULong( NtUserGetProp( hwnd, defer_tick_prop ))))
+        NtUserSetProp( hwnd, defer_tick_prop, ULongToHandle( now | 1 ));
+    else if (now - defer >= 1000 &&
+             now - HandleToULong( NtUserGetProp( hwnd, app_tick_prop )) >= 1000)
+    {
+        /* a long drag: let the application draw once a second all the same */
+        NtUserSetProp( hwnd, app_tick_prop, ULongToHandle( now | 1 ));
+        return FALSE;
+    }
+    size = HandleToULong( NtUserGetProp( hwnd, comp_size_prop ));
+
+    if (!(hdc = NtUserBeginPaint( hwnd, &ps ))) return FALSE;
+    NtGdiBitBlt( hdc, 0, 0, LOWORD(size), HIWORD(size), comp, 0, 0, SRCCOPY, 0, 0 );
+    NtUserEndPaint( hwnd, &ps );
+    NtUserSetSystemTimer( hwnd, SYSTEM_TIMER_MOVE_REPAINT, 120 );
+    return TRUE;
+}
+
+/* The moves have stopped: forget the deferral of paint_from_swapchain_frame(). */
+void end_swapchain_frame_paints( HWND hwnd )
+{
+    static const WCHAR defer_tick_prop[] = {'_','_','w','i','n','e','_','p','a','i','n','t','_','d','e','f','e','r','_','t','i','c','k',0};
+    NtUserRemoveProp( hwnd, defer_tick_prop );
+}
+
 /* Paint the windows below parent that a moved child uncovered (or that are
  * otherwise waiting for a paint), now and in this thread, before the next mouse
  * move is handled.  A paint waits until no input is queued, and while a window
@@ -2220,7 +2279,7 @@ void paint_uncovered_windows( HWND parent )
 
         if (!get_update_flags( parent, &child, &flags ) || !flags || !child) break;
         if (!is_current_thread_window( child )) break;
-        send_message( child, WM_PAINT, 0, 0 );
+        if (!paint_from_swapchain_frame( child )) send_message( child, WM_PAINT, 0, 0 );
     }
 }
 

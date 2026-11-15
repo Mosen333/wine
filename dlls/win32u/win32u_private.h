@@ -340,6 +340,8 @@ extern BOOL get_window_rects( HWND hwnd, enum coords_relative relative,
 extern HWND *list_window_children( HWND hwnd );
 extern void repaint_gdi_children( HWND hwnd );
 extern void paint_uncovered_windows( HWND parent );
+extern BOOL paint_from_swapchain_frame( HWND hwnd );
+extern void end_swapchain_frame_paints( HWND hwnd );
 extern int map_window_points( HWND hwnd_from, HWND hwnd_to, POINT *points, UINT count,
                               struct ratio dpi );
 extern void map_window_region( HWND from, HWND to, HRGN hrgn );
