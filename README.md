@@ -80,11 +80,18 @@
 |  Both are maintained by their authors, independently of this repository.   |
 |                                                                            |
 |  FROM SOURCE                                                               |
-|    $ git clone https://github.com/giang17/wine.git && cd wine              |
-|    $ git checkout d2d1-dcomp-11.22                                         |
+|    $ git clone https://github.com/Mosen333/wine.git && cd wine             |
+|    $ git checkout d2d1-dcomp-11.22-plugins                                 |
 |    $ ./configure --prefix=/opt/wine-d2d1 --enable-archs=i386,x86_64        |
 |    $ make -j$(nproc)                                                       |
-|    $ sudo make install                                                     |
+|    $ sudo make install DESTDIR=/your/directory                             |
+|                                                                            |
+|  d2d1-dcomp-11.22-plugins is the main branch; on Hyprland, check out       |
+|  d2d1-dcomp-11.22-plugins-hyprland instead.                                |
+|                                                                            |
+|  The opt directory in the destination directory holds the Wine runner      |
+|  folder, which can be copied to wherever a prefix manager such as          |
+|  Bottles keeps its runners.                                                |
 |                                                                            |
 |  Build both architectures, with the i686-w64-mingw32 and                   |
 |  x86_64-w64-mingw32 cross compilers: 32-bit hosts and plugins load d2d1,   |
