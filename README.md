@@ -129,13 +129,16 @@ pwrshsip (new) · powershell.exe · winemenubuilder.exe · and more than twenty 
 ## Quick start
 
 ```bash
-git clone https://github.com/giang17/wine.git
+git clone https://github.com/Mosen333/wine.git
 cd wine
-git checkout d2d1-dcomp-11.21    # this branch; d2d1-dcomp-11.0 is the stable one
+git checkout d2d1-dcomp-11.21-plugins    # the main branch; d2d1-dcomp-11.21-plugins-hyprland for hyprland users
 ./configure --prefix=/opt/wine-d2d1 --enable-archs=i386,x86_64
 make -j$(nproc)
-sudo make install
+sudo make install DESTDIR=/your/directory
 ```
+
+The opt directory in your destination directory contains the wine runner folder, which you
+can copy to your desired location for use with a wineprefix manager (like bottles).
 
 Use a separate `--prefix` so your distribution's Wine stays untouched. Build **both**
 architectures: 32-bit hosts and plugins load `d2d1`, `dcomp` and `dxgi` directly, and a
