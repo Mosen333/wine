@@ -451,6 +451,12 @@ HKCU,"Software\Wine\AppDefaults\Cubase12.exe","HideWineVersion",2,"Y"
 HKCU,"Software\Wine\AppDefaults\Cubase13.exe","HideWineVersion",2,"Y"
 HKCU,"Software\Wine\AppDefaults\Cubase14.exe","HideWineVersion",2,"Y"
 HKCU,"Software\Wine\AppDefaults\Cubase15.exe","HideWineVersion",2,"Y"
+; FL Studio draws its own frame and resizes without WS_THICKFRAME, so winex11 pins its
+; main window with min = max size hints in X pixels.  Hyprland reads those hints in
+; logical pixels under xwayland:force_zero_scaling: on a scaled monitor every resize
+; grew the window by the scale factor until it passed the X size limit and vanished,
+; and FL saved that size for the next start.  Let the window manager resize it.
+HKCU,"Software\Wine\AppDefaults\FL64.exe\X11 Driver","ResizeUnframedWindows",2,"Y"
 
 [DirectX]
 HKLM,Software\Microsoft\DirectX,"Version",,"4.09.00.0904"
