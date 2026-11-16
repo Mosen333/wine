@@ -1593,16 +1593,33 @@ static void restart_timer( struct msg_queue *queue, struct timer *timer )
     set_next_timer( queue );
 }
 
-/* find an expired timer matching the filtering parameters */
+/* how long an expired timer may wait behind input and WM_PAINT, and a window
+ * behind the WM_PAINTs of the windows above it, see get_message;
+ * WINE_DRAGFIX_TIMER_STARVE_MS, 0 keeps the Windows order */
+static timeout_t timer_starve_time(void)
+{
+    static int ms = -1;
+
+    if (ms < 0)
+    {
+        const char *str = getenv( "WINE_DRAGFIX_TIMER_STARVE_MS" );
+        ms = str ? atoi( str ) : 16;
+    }
+    return (timeout_t)ms * 10000;
+}
+
+/* find an expired timer matching the filtering parameters, one that has been due
+ * for at least min_overdue if that is not 0 */
 static struct timer *find_expired_timer( struct msg_queue *queue, user_handle_t win,
                                          unsigned int get_first, unsigned int get_last,
-                                         int remove )
+                                         int remove, timeout_t min_overdue )
 {
     struct timer *timer;
 
     LIST_FOR_EACH_ENTRY( timer, &queue->expired_timers, struct timer, entry )
     {
         if (win && timer->win != win) continue;
+        if (min_overdue && monotonic_time + timer->when < min_overdue) continue;
         if (check_msg_filter( timer->msg, get_first, get_last ))
         {
             if (remove) restart_timer( queue, timer );
@@ -3380,6 +3397,38 @@ DECL_HANDLER(get_message)
     if ((filter & QS_POSTMESSAGE) && get_quit_message( queue, req->flags, reply ))
         return;
 
+    /* WM_TIMER comes after input and WM_PAINT, as on Windows, so a thread that
+     * gets input faster than it handles it never sees its timers: none at all
+     * reached FL Studio's thread while a plugin window was dragged, with each
+     * move taking it longer than the mouse took to the next, and the plugins
+     * that animate from timers -- Serum 2, HG-2MS -- froze until the drag
+     * ended, and their WM_PAINTs waited for one of the rare moments without
+     * a mouse move.  A timer that is overdue, or a window that has waited for
+     * its WM_PAINT, by more than a frame goes first. */
+    if ((filter & QS_TIMER) && timer_starve_time() &&
+        (timer = find_expired_timer( queue, get_win, req->get_first, req->get_last,
+                                     (req->flags & PM_REMOVE), timer_starve_time() )))
+    {
+        reply->type   = MSG_POSTED;
+        reply->win    = timer->win;
+        reply->msg    = timer->msg;
+        reply->wparam = timer->id;
+        reply->lparam = timer->lparam;
+        get_message_defaults( queue, &reply->x, &reply->y, &reply->time );
+        return;
+    }
+    if ((filter & QS_PAINT) && timer_starve_time() && queue->paint_count &&
+        check_msg_filter( WM_PAINT, req->get_first, req->get_last ) &&
+        (reply->win = find_waiting_window_to_repaint( get_win, current, timer_starve_time() )))
+    {
+        reply->type   = MSG_POSTED;
+        reply->msg    = WM_PAINT;
+        reply->wparam = 0;
+        reply->lparam = 0;
+        get_message_defaults( queue, &reply->x, &reply->y, &reply->time );
+        return;
+    }
+
     /* then check for any raw hardware message */
     if ((filter & QS_INPUT) &&
         filter_contains_hw_range( req->get_first, req->get_last ) &&
@@ -3390,7 +3439,7 @@ DECL_HANDLER(get_message)
     if ((filter & QS_PAINT) &&
         queue->paint_count &&
         check_msg_filter( WM_PAINT, req->get_first, req->get_last ) &&
-        (reply->win = find_window_to_repaint( get_win, current )))
+        (reply->win = find_window_to_repaint( get_win, current, timer_starve_time() )))
     {
         reply->type   = MSG_POSTED;
         reply->msg    = WM_PAINT;
@@ -3403,7 +3452,7 @@ DECL_HANDLER(get_message)
     /* now check for timer */
     if ((filter & QS_TIMER) &&
         (timer = find_expired_timer( queue, get_win, req->get_first,
-                                     req->get_last, (req->flags & PM_REMOVE) )))
+                                     req->get_last, (req->flags & PM_REMOVE), 0 )))
     {
         reply->type   = MSG_POSTED;
         reply->win    = timer->win;

@@ -92,6 +92,7 @@ struct window
     int              prop_alloc;      /* number of allocated window properties */
     struct property *properties;      /* window properties array */
     window_shm_t    *shared;          /* window in session shared memory */
+    timeout_t        paint_since;     /* when the update region was last set from empty */
 };
 
 C_ASSERT( sizeof(window_shm_t) == offsetof(window_shm_t, extra[0]) );
@@ -695,6 +696,7 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->text           = NULL;
     win->text_len       = 0;
     win->paint_flags    = 0;
+    win->paint_since    = 0;
     win->prop_inuse     = 0;
     win->prop_alloc     = 0;
     win->properties     = NULL;
@@ -1169,15 +1171,75 @@ static struct window *find_child_to_repaint( struct window *parent, struct threa
 }
 
 
-/* find a window that needs to receive a WM_PAINT; also clear its internal paint flag */
-user_handle_t find_window_to_repaint( user_handle_t parent, struct thread *thread )
+/* find the window below parent whose update region has waited longest, at least
+ * min_wait, for a WM_PAINT.  A window paints after its parent, if the parent's
+ * own update region reaches into it and the parent does not clip its children:
+ * block holds those regions of the windows above, in coordinates relative to
+ * the client area of the top window, and (x, y) is where that of parent is. */
+static void find_waiting_child_to_repaint( struct window *parent, struct thread *thread, timeout_t min_wait,
+                                           int x, int y, struct region *block, struct window **ret )
 {
-    struct window *ptr, *win, *top_window = get_desktop_window( thread );
+    struct region *child_block;
+    struct rectangle rect;
+    struct window *ptr;
+
+    LIST_FOR_EACH_ENTRY( ptr, &parent->children, struct window, entry )
+    {
+        if (!(ptr->style & WS_VISIBLE)) continue;
+        child_block = block;
+        if (ptr->thread == thread && win_needs_repaint( ptr ))
+        {
+            rect = ptr->window_rect;
+            rect.left += x; rect.right += x; rect.top += y; rect.bottom += y;
+            if (ptr->update_region && monotonic_time - ptr->paint_since >= min_wait &&
+                (!*ret || ptr->paint_since < (*ret)->paint_since) &&
+                (!block || !rect_in_region( block, &rect )))
+                *ret = ptr;
+            if (!ptr->update_region || (ptr->style & WS_CLIPCHILDREN)) ;
+            else if (!(child_block = create_empty_region())) return;
+            else
+            {
+                copy_region( child_block, ptr->update_region );
+                offset_region( child_block, rect.left, rect.top );
+                if (block) union_region( child_block, child_block, block );
+            }
+        }
+        if (!(ptr->style & WS_MINIMIZE))
+            find_waiting_child_to_repaint( ptr, thread, min_wait, x + ptr->client_rect.left,
+                                           y + ptr->client_rect.top, child_block, ret );
+        if (child_block != block) free_region( child_block );
+    }
+}
+
+/* find a window that has waited for min_wait for a WM_PAINT, see find_window_to_repaint() */
+user_handle_t find_waiting_window_to_repaint( user_handle_t parent, struct thread *thread, timeout_t min_wait )
+{
+    struct window *win = NULL, *top_window = get_desktop_window( thread );
+
+    if (!top_window || parent || (top_window->thread == thread && win_needs_repaint( top_window ))) return 0;
+    find_waiting_child_to_repaint( top_window, thread, min_wait, 0, 0, NULL, &win );
+    if (!win) return 0;
+    win->paint_flags &= ~PAINT_INTERNAL;
+    return win->handle;
+}
+
+/* find a window that needs to receive a WM_PAINT; also clear its internal paint flag.
+ * WM_PAINT goes to the topmost window first, which leaves the windows below
+ * waiting for as long as the ones above are invalidated again: an animated
+ * plugin editor below one dragged in FL Studio got a third of its paints.  A
+ * window that has waited for min_wait goes first, if min_wait is not 0. */
+user_handle_t find_window_to_repaint( user_handle_t parent, struct thread *thread, timeout_t min_wait )
+{
+    struct window *ptr, *win = NULL, *top_window = get_desktop_window( thread );
 
     if (!top_window) return 0;
 
     if (top_window->thread == thread && win_needs_repaint( top_window )) win = top_window;
-    else win = find_child_to_repaint( top_window, thread );
+    else
+    {
+        if (min_wait && !parent) find_waiting_child_to_repaint( top_window, thread, min_wait, 0, 0, NULL, &win );
+        if (!win) win = find_child_to_repaint( top_window, thread );
+    }
 
     if (win && parent)
     {
@@ -1663,7 +1725,11 @@ static void set_update_region( struct window *win, struct region *region )
 {
     if (region && !is_region_empty( region ))
     {
-        if (!win->update_region) inc_window_paint_count( win, 1 );
+        if (!win->update_region)
+        {
+            inc_window_paint_count( win, 1 );
+            win->paint_since = monotonic_time;
+        }
         else free_region( win->update_region );
         win->update_region = region;
     }
