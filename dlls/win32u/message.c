@@ -4102,8 +4102,9 @@ LRESULT WINAPI NtUserDispatchMessage( const MSG *msg )
                 return 0;
 
             case SYSTEM_TIMER_MOVE_REPAINT:
+                /* not while the drag goes on */
+                if (windows_moving( msg->hwnd )) return 0;
                 NtUserKillSystemTimer( msg->hwnd, SYSTEM_TIMER_MOVE_REPAINT );
-                end_swapchain_frame_paints( msg->hwnd );
                 repaint_gdi_children( msg->hwnd );
                 return 0;
         }
@@ -4111,7 +4112,7 @@ LRESULT WINAPI NtUserDispatchMessage( const MSG *msg )
 
     if (!msg->hwnd) return 0;
 
-    if (msg->message == WM_PAINT && paint_from_swapchain_frame( msg->hwnd )) return 0;
+    if (msg->message == WM_PAINT && paint_from_frame( msg->hwnd )) return 0;
 
     spy_enter_message( SPY_DISPATCHMESSAGE, msg->hwnd, msg->message, msg->wParam, msg->lParam );
 

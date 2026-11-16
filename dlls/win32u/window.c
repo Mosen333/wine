@@ -544,6 +544,16 @@ void repaint_gdi_children( HWND hwnd )
  * client surface - follows at once, and the two come apart.  Flush the top-level
  * now, at most every WINE_DRAGFIX_FLUSH ms (default 8, 0 disables), and present the
  * client surfaces below the window again (WINE_DRAGFIX_REPRESENT=0 disables). */
+/* Have windows been moved in the top-level of hwnd within the last 150 ms (the
+ * stamp after_child_move() leaves)? */
+BOOL windows_moving( HWND hwnd )
+{
+    static const WCHAR child_move_tick_prop[] = {'_','_','w','i','n','e','_','c','h','i','l','d','_','m','o','v','e','_','t','i','c','k',0};
+    DWORD moved = HandleToULong( NtUserGetProp( NtUserGetAncestor( hwnd, GA_ROOT ), child_move_tick_prop ));
+
+    return moved && NtGetTickCount() - moved < 150;
+}
+
 static void after_child_move( HWND hwnd )
 {
     static const WCHAR child_move_tick_prop[] =
@@ -565,15 +575,14 @@ static void after_child_move( HWND hwnd )
         updatenow = str ? atoi( str ) : 1;
     }
 
-    /* tell the DirectComposition emulation that windows are being moved here, so
-     * it answers the WM_PAINTs this brings from the composed frame (dcomp,
-     * dcomp_target_paint_from_frame()) and leaves the application's own alone */
+    /* note that windows are being moved here, so that the WM_PAINTs this brings
+     * are answered from the windows' frames (windows_moving(), paint_from_frame()) */
     NtUserSetProp( NtUserGetAncestor( hwnd, GA_ROOT ), child_move_tick_prop,
                    ULongToHandle( NtGetTickCount() | 1 ));
     if (updatenow) paint_uncovered_windows( NtUserGetAncestor( hwnd, GA_PARENT ) );
 
-    /* once the moves stop: timer messages come after input and paints, so it
-     * fires when the mouse rests and takes no paint away from the windows below */
+    /* once the moves stop: the timer does nothing while windows_moving(), so it
+     * takes no paint away from the windows below during the drag */
     if (repaint) NtUserSetSystemTimer( hwnd, SYSTEM_TIMER_MOVE_REPAINT, repaint > 1 ? repaint : 60 );
     if (represent) represent_client_surfaces( hwnd );
 
@@ -6024,6 +6033,7 @@ static void free_window_handle( HWND hwnd )
         }
         SERVER_END_REQ;
         user_unlock();
+        if (win->app_dirty) NtGdiDeleteObjectApp( win->app_dirty );
         free( win->pScroll );
         free( win->text );
         free( win );

@@ -153,7 +153,6 @@ static void dcomp_device_remove_target(struct dcomp_device *device, struct dcomp
 #define DCOMP_ANIMATION_TIMER ((UINT_PTR)0xDC0FFEE3)   /* issue 364 */
 #define DCOMP_HUD_TIMER      ((UINT_PTR)0xDC0FFEE4)   /* issue 590 */
 #define DCOMP_HUD_TIMER_MS   250
-#define DCOMP_PAINT_TIMER    ((UINT_PTR)0xDC0FFEE5)   /* repaint deferred from a burst, see dcomp_target_paint_from_frame() */
 #define DCOMP_TREE_FRAME_MS  16   /* ~60 Hz rate limit for hook-driven composites */
 
 /* Measurement dial (issue 206): the tree timer period, adjustable without a
@@ -3861,11 +3860,10 @@ struct dcomp_target
     BOOL stack_visible;
     HRGN stack_clip;                      /* client-space area the targets above have on screen */
     struct dcomp_hud hud;                 /* WINE_DCOMP_HUD overlay (issue 399), unused without the variable */
-    /* WM_PAINT bursts answered from the composed frame, see dcomp_target_paint_from_frame() */
-    DWORD paint_app_tick;                 /* GetTickCount of the last WM_PAINT the application answered */
-    HRGN paint_deferred;                  /* what it has not been asked to repaint since */
-    DWORD paint_defer_tick;               /* GetTickCount when paint_deferred started */
-    BOOL paint_app_next;                  /* the next WM_PAINT goes to the application */
+    /* The composed frame as published to win32u for WM_PAINTs during window moves,
+     * see dcomp_target_publish_frame() */
+    HDC published_frame_dc;
+    DWORD published_frame_size;
     /* WndProc subclass for WM_ERASEBKGND / WM_PAINT protection (Phase 5) */
     WNDPROC orig_wndproc;
 };
@@ -3978,8 +3976,6 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
             list_remove(&target->all_entry);
         if (target->stack_clip)
             DeleteObject(target->stack_clip);
-        if (target->paint_deferred)
-            DeleteObject(target->paint_deferred);
         if (target->comp_bitmap)
         {
             SelectObject(target->comp_dc, NULL);
@@ -4657,6 +4653,46 @@ static void dcomp_device_remove_target(struct dcomp_device *device, struct dcomp
     LeaveCriticalSection(&device->cs);
 }
 
+/* win32u answers a WM_PAINT that only asks for what a window moved off this
+ * one uncovered from the composed frame, while windows are being moved in the
+ * top-level, and passes on to the application what the application itself
+ * invalidated (paint_from_frame()).  On Windows the DWM keeps showing a surface
+ * root whatever happens around it; here the WM_PAINT for the uncovered strip
+ * reached Serum 2 (VSTGUI), which re-rendered 1190x367 for a strip 3 pixels
+ * wide, 20 to 90 ms each, on every step of a plugin window dragged over it in
+ * FL Studio.  Publish the frame of a surface root for that; a rootless tree or
+ * a swapchain root answers its WM_PAINT in its own ways and is left out. */
+static const WCHAR dcomp_frame_dc_prop[] = L"__wine_frame_dc";
+static const WCHAR dcomp_frame_size_prop[] = L"__wine_frame_size";
+
+static void dcomp_target_publish_frame(struct dcomp_target *target)
+{
+    DWORD size;
+
+    if (!target->hwnd || !target->comp_dc || !target->root_visual || !target->root_visual->surface_content)
+        return;
+    size = MAKELONG(target->comp_width, target->comp_height);
+    if (target->published_frame_dc == target->comp_dc && target->published_frame_size == size)
+        return;
+    SetPropW(target->hwnd, dcomp_frame_size_prop, ULongToHandle(size));
+    SetPropW(target->hwnd, dcomp_frame_dc_prop, target->comp_dc);
+    target->published_frame_dc = target->comp_dc;
+    target->published_frame_size = size;
+}
+
+static void dcomp_target_retract_frame(struct dcomp_target *target)
+{
+    if (!target->published_frame_dc)
+        return;
+    if (target->hwnd)
+    {
+        RemovePropW(target->hwnd, dcomp_frame_dc_prop);
+        RemovePropW(target->hwnd, dcomp_frame_size_prop);
+    }
+    target->published_frame_dc = NULL;
+    target->published_frame_size = 0;
+}
+
 static void dcomp_target_ensure_comp_dc(struct dcomp_target *target, UINT width, UINT height)
 {
     BITMAPINFO bmi;
@@ -4667,6 +4703,7 @@ static void dcomp_target_ensure_comp_dc(struct dcomp_target *target, UINT width,
 
     /* The old frame goes away under the process-wide lock: a present of a
      * target on a child window may be reading it as its backdrop right now. */
+    dcomp_target_retract_frame(target);
     EnterCriticalSection(&dcomp_all_targets_cs);
 
     /* Clean up old */
@@ -8140,6 +8177,7 @@ static void dcomp_target_flush_present(struct dcomp_target *target, struct dcomp
     dcomp_target_present_region(target, surface, l, t, r, b, present_dirty);
     target->comp_needs_full_present = FALSE;
     target->last_present_qpc = dcomp_qpc_now();
+    dcomp_target_publish_frame(target);
 }
 
 /* Move a target's tree to `now' -- taking pending animations over when this
@@ -8198,112 +8236,6 @@ static void dcomp_target_animation_tick(struct dcomp_target *target)
  * WM_PAINT is forwarded to the original WndProc so that VSTGUI can call
  * BeginDraw → Render → EndDraw → Commit in response to paint requests. */
 
-/* Put the last composed frame back into rect of the window (client coordinates),
- * and the targets on child windows over it.  Only for a window with nothing on
- * the way: a frame drawn but waiting for the coalesced present (issue 56) gets
- * there through that present. */
-static BOOL dcomp_target_restore_frame(struct dcomp_target *target, HWND hwnd, RECT update)
-{
-    BOOL done = FALSE;
-
-    if (!target->device)
-        return FALSE;
-    EnterCriticalSection(&target->device->cs);
-    if (target->comp_dc && target->comp_bits
-            && target->root_visual && target->root_visual->surface_content
-            && !target->root_visual->surface_content->has_pending)
-    {
-        BOOL dc_saved = FALSE;
-        HDC hdc;
-
-        if (update.left < 0) update.left = 0;
-        if (update.top < 0) update.top = 0;
-        if (update.right > (LONG)target->comp_width) update.right = target->comp_width;
-        if (update.bottom > (LONG)target->comp_height) update.bottom = target->comp_height;
-        if (update.right > update.left && update.bottom > update.top
-                && (hdc = dcomp_target_get_dc(target, &dc_saved)))
-        {
-            TRACE("Restoring %s of the composed frame on hwnd %p.\n", wine_dbgstr_rect(&update), hwnd);
-            BitBlt(hdc, update.left, update.top, update.right - update.left,
-                    update.bottom - update.top, target->comp_dc, update.left, update.top, SRCCOPY);
-            dcomp_target_release_dc(target, hdc, dc_saved);
-            dcomp_target_present_nested(target, update.left, update.top, update.right, update.bottom);
-            done = TRUE;
-        }
-    }
-    LeaveCriticalSection(&target->device->cs);
-    return done;
-}
-
-/* On Windows the DWM keeps composing a surface root whatever happens to the
- * window, so a window above that moves away just shows it again; the
- * application is not asked to draw anything.  Here the WM_PAINT for the
- * uncovered part reaches the application, and one that draws through a
- * composition surface may well redraw much more than was asked: Serum 2
- * (VSTGUI) re-rendered 1190x367 for a strip 3 pixels wide, 20 to 90 ms each,
- * and a plugin window dragged over it in FL Studio uncovered such a strip on
- * every step.  While windows are being moved inside the top-level (win32u
- * stamps "__wine_child_move_tick" on it for every child move), answer them from
- * the composed frame instead, and let the application repaint all it was spared
- * once the moves stop (DCOMP_PAINT_TIMER), or once a second during a long drag.
- * Letting the first WM_PAINT of each burst through still cost 60 ms a burst,
- * most of a drag over a Serum 2.  Only during moves: Serum 2 also animates its
- * wavetables and envelopes through WM_PAINT, and those must reach it at once.
- * WINE_DCOMP_PAINT_FROM_FRAME=0 turns it off. */
-#define DCOMP_PAINT_MOVE_MS  150
-#define DCOMP_PAINT_APP_MS   1000
-#define DCOMP_PAINT_LATER_MS 120
-
-static BOOL dcomp_target_paint_from_frame(struct dcomp_target *target, HWND hwnd)
-{
-    static int enabled = -1;
-    DWORD now = GetTickCount(), moved;
-    PAINTSTRUCT ps;
-    RECT update;
-    HRGN rgn;
-
-    if (enabled < 0)
-    {
-        const char *e = getenv("WINE_DCOMP_PAINT_FROM_FRAME");
-        enabled = (!e || atoi(e)) ? 1 : 0;
-    }
-    moved = HandleToULong(GetPropW(GetAncestor(hwnd, GA_ROOT), L"__wine_child_move_tick"));
-    if (!enabled || target->paint_app_next || !moved || now - moved >= DCOMP_PAINT_MOVE_MS)
-        goto app;
-    /* a long drag: let the application draw once a second all the same */
-    if (target->paint_deferred && now - target->paint_defer_tick >= DCOMP_PAINT_APP_MS
-            && now - target->paint_app_tick >= DCOMP_PAINT_APP_MS)
-        goto app;
-    if (!GetUpdateRect(hwnd, &update, FALSE) || !(rgn = CreateRectRgn(0, 0, 0, 0)))
-        goto app;
-    GetUpdateRgn(hwnd, rgn, FALSE);
-    BeginPaint(hwnd, &ps);
-    EndPaint(hwnd, &ps);
-    if (!dcomp_target_restore_frame(target, hwnd, update))
-    {
-        /* nothing to put back: give it to the application after all */
-        InvalidateRgn(hwnd, rgn, FALSE);
-        DeleteObject(rgn);
-        goto app;
-    }
-    if (!target->paint_deferred)
-    {
-        target->paint_deferred = rgn;
-        target->paint_defer_tick = now;
-    }
-    else
-    {
-        CombineRgn(target->paint_deferred, target->paint_deferred, rgn, RGN_OR);
-        DeleteObject(rgn);
-    }
-    SetTimer(hwnd, DCOMP_PAINT_TIMER, DCOMP_PAINT_LATER_MS, NULL);
-    return TRUE;
-
-app:
-    target->paint_app_next = FALSE;
-    target->paint_app_tick = now;
-    return FALSE;
-}
 
 static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
@@ -8368,20 +8300,6 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
         if (wparam == DCOMP_TREE_TIMER)
         {
             dcomp_target_composite_tree(target, TRUE);
-            return 0;
-        }
-        /* The burst of WM_PAINTs is over: let the application repaint what we
-         * answered from the frame, in case it had something new for it. */
-        if (wparam == DCOMP_PAINT_TIMER)
-        {
-            KillTimer(hwnd, DCOMP_PAINT_TIMER);
-            if (target->paint_deferred)
-            {
-                target->paint_app_next = TRUE;
-                InvalidateRgn(hwnd, target->paint_deferred, FALSE);
-                DeleteObject(target->paint_deferred);
-                target->paint_deferred = NULL;
-            }
             return 0;
         }
         /* Animations on a surface or swapchain root (issue 364). */
@@ -8499,8 +8417,6 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
 
             if (!GetUpdateRect(hwnd, &update, FALSE))
                 break;
-            if (dcomp_target_paint_from_frame(target, hwnd))
-                return 0;
 
             ret = orig_wndproc
                     ? CallWindowProcW(orig_wndproc, hwnd, msg, wparam, lparam)
@@ -8551,6 +8467,7 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
          * procedure at all. */
         KillTimer(hwnd, DCOMP_TREE_TIMER);
         KillTimer(hwnd, DCOMP_ANIMATION_TIMER);
+        dcomp_target_retract_frame(target);
         KillTimer(hwnd, DCOMP_HUD_TIMER);
         /* Tell our delivery thread to stop, but do not wait for it here: it may
          * be inside a GDI call on the very window being torn down, and blocking

@@ -81,6 +81,7 @@ typedef struct tagWND
     int                pixel_format;  /* Pixel format set by the graphics driver */
     int                clip_clients;  /* Has client surfaces that needs to be clipped out */
     int                present_offscreen; /* a client surface presents offscreen into this child, see update_visible_region() */
+    HRGN               app_dirty;     /* what the window's thread invalidated itself since its last BeginPaint, see paint_from_frame() */
 } WND;
 
 /* WND flags values */

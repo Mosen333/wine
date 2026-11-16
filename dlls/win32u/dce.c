@@ -61,6 +61,8 @@ static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
  * Remember the surface an erase went to and hold its flushes back while the
  * window's thread still has paint work queued, for a bounded time. */
 static BOOL get_update_flags( HWND hwnd, HWND *child, UINT *flags );
+static void note_app_invalidation( HWND hwnd, const RECT *rect, HRGN hrgn );
+static void clear_app_invalidation( HWND hwnd );
 static pthread_mutex_t erase_hold_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct window_surface *erase_hold_surface;  /* identity only, never dereferenced */
 static DWORD erase_hold_until;
@@ -2115,6 +2117,7 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
     UINT flags = UPDATE_NONCLIENT | UPDATE_ERASE | UPDATE_PAINT | UPDATE_INTERNALPAINT | UPDATE_NOCHILDREN;
 
     NtUserHideCaret( hwnd );
+    clear_app_invalidation( hwnd );
 
     if (!(hrgn = send_ncpaint( hwnd, NULL, &flags ))) return 0;
 
@@ -2201,63 +2204,127 @@ static void update_now( HWND hwnd, UINT rdw_flags )
     }
 }
 
-/* Answer a WM_PAINT of a window that a D3D swap chain presents into from the
- * frame wined3d keeps for it, while windows are being moved in its top-level.
- * wined3d publishes that frame as "__wine_dcomp_comp_dc" (swapchain_blit_gdi());
- * a window with a composition subclass of dxgi or dcomp answers its WM_PAINT
- * itself and is left alone.  HG-2MS (VSTGUI over Direct2D) re-rendered 13 to
- * 77 ms for every strip a plugin window dragged over it in FL Studio uncovered,
- * which made the drag stall.  As the DWM would, show the last frame instead and
- * let the application repaint once the moves stop (SYSTEM_TIMER_MOVE_REPAINT,
- * repaint_gdi_children()), or once a second during a long drag.  The move stamp
- * is the one after_child_move() leaves on the top-level.
- * WINE_DRAGFIX_SWAPCHAIN_FRAME=0 turns it off. */
-BOOL paint_from_swapchain_frame( HWND hwnd )
+/* What the window's own thread invalidates is what the application wants to
+ * draw; the rest of an update region comes from outside, from windows moved off
+ * it.  paint_from_frame() keeps the two apart. */
+static void note_app_invalidation( HWND hwnd, const RECT *rect, HRGN hrgn )
 {
+    HRGN add, cur;
+    RECT client;
+    WND *win;
+
+    if (!hwnd || !is_current_thread_window( hwnd )) return;
+    if (hrgn)
+    {
+        if (!(add = NtGdiCreateRectRgn( 0, 0, 0, 0 ))) return;
+        NtGdiCombineRgn( add, hrgn, 0, RGN_COPY );
+    }
+    else
+    {
+        if (rect) client = *rect;
+        else if (!get_client_rect( hwnd, &client, get_thread_dpi() )) return;
+        if (!(add = NtGdiCreateRectRgn( client.left, client.top, client.right, client.bottom ))) return;
+    }
+    if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS || win == WND_DESKTOP)
+    {
+        NtGdiDeleteObjectApp( add );
+        return;
+    }
+    if ((cur = win->app_dirty)) win->app_dirty = 0;
+    else win->app_dirty = add;
+    release_win_ptr( win );
+    if (!cur) return;
+    /* only this thread touches app_dirty, so it can be combined unlocked */
+    NtGdiCombineRgn( cur, cur, add, RGN_OR );
+    NtGdiDeleteObjectApp( add );
+    if ((win = get_win_ptr( hwnd )) && win != WND_OTHER_PROCESS && win != WND_DESKTOP)
+    {
+        win->app_dirty = cur;
+        release_win_ptr( win );
+    }
+    else NtGdiDeleteObjectApp( cur );
+}
+
+static void clear_app_invalidation( HWND hwnd )
+{
+    HRGN cur = 0;
+    WND *win;
+
+    if ((win = get_win_ptr( hwnd )) && win != WND_OTHER_PROCESS && win != WND_DESKTOP)
+    {
+        cur = win->app_dirty;
+        win->app_dirty = 0;
+        release_win_ptr( win );
+    }
+    if (cur) NtGdiDeleteObjectApp( cur );
+}
+
+/* While windows are being moved in the top-level, answer the part of a
+ * WM_PAINT that only asks for what a window moved off this one uncovered from
+ * the window's last frame, as the DWM would, and leave the part the application
+ * invalidated itself to the application.  The frame is the one wined3d keeps
+ * for a swap chain window ("__wine_dcomp_comp_dc", when no composition subclass
+ * answers the window's WM_PAINT), or the one dcomp publishes for a surface root
+ * ("__wine_frame_dc").  VSTGUI re-renders far more than it is asked for: HG-2MS
+ * 13 to 77 ms, Serum 2 20 to 150 ms for each strip a plugin window dragged over
+ * it in FL Studio uncovered, which stalled the drag.  Their own invalidations --
+ * Serum 2 animates its wavetables and envelopes that way -- still reach them
+ * at once.  WINE_DRAGFIX_FRAME_PAINT=0 turns it off.
+ * Returns TRUE when nothing is left for the application. */
+BOOL paint_from_frame( HWND hwnd )
+{
+    static const WCHAR frame_dc_prop[] = {'_','_','w','i','n','e','_','f','r','a','m','e','_','d','c',0};
+    static const WCHAR frame_size_prop[] = {'_','_','w','i','n','e','_','f','r','a','m','e','_','s','i','z','e',0};
     static const WCHAR comp_dc_prop[] = {'_','_','w','i','n','e','_','d','c','o','m','p','_','c','o','m','p','_','d','c',0};
     static const WCHAR comp_size_prop[] = {'_','_','w','i','n','e','_','d','c','o','m','p','_','c','o','m','p','_','s','i','z','e',0};
     static const WCHAR subclass_prop[] = {'_','_','w','i','n','e','_','d','c','o','m','p','_','s','u','b','c','l','a','s','s','_','p','r','o','c',0};
-    static const WCHAR move_tick_prop[] = {'_','_','w','i','n','e','_','c','h','i','l','d','_','m','o','v','e','_','t','i','c','k',0};
-    static const WCHAR defer_tick_prop[] = {'_','_','w','i','n','e','_','p','a','i','n','t','_','d','e','f','e','r','_','t','i','c','k',0};
-    static const WCHAR app_tick_prop[] = {'_','_','w','i','n','e','_','p','a','i','n','t','_','a','p','p','_','t','i','c','k',0};
     static int enabled = -1;
-    DWORD now, moved, defer, size;
-    PAINTSTRUCT ps;
-    HDC comp, hdc;
+    HRGN update, uncovered, app = 0;
+    BOOL done = FALSE;
+    DWORD size;
+    HDC frame, hdc;
+    WND *win;
 
     if (enabled < 0)
     {
-        const char *str = getenv( "WINE_DRAGFIX_SWAPCHAIN_FRAME" );
+        const char *str = getenv( "WINE_DRAGFIX_FRAME_PAINT" );
         enabled = str ? atoi( str ) : 1;
     }
-    if (!enabled || !is_current_thread_window( hwnd )) return FALSE;
-    if (!(comp = NtUserGetProp( hwnd, comp_dc_prop )) || NtUserGetProp( hwnd, subclass_prop )) return FALSE;
-    now = NtGetTickCount();
-    moved = HandleToULong( NtUserGetProp( NtUserGetAncestor( hwnd, GA_ROOT ), move_tick_prop ));
-    if (!moved || now - moved >= 150) return FALSE;
-    if (!(defer = HandleToULong( NtUserGetProp( hwnd, defer_tick_prop ))))
-        NtUserSetProp( hwnd, defer_tick_prop, ULongToHandle( now | 1 ));
-    else if (now - defer >= 1000 &&
-             now - HandleToULong( NtUserGetProp( hwnd, app_tick_prop )) >= 1000)
+    if (!enabled || !is_current_thread_window( hwnd ) || !windows_moving( hwnd )) return FALSE;
+    if ((frame = NtUserGetProp( hwnd, frame_dc_prop )))
+        size = HandleToULong( NtUserGetProp( hwnd, frame_size_prop ));
+    else if (!NtUserGetProp( hwnd, subclass_prop ) && (frame = NtUserGetProp( hwnd, comp_dc_prop )))
+        size = HandleToULong( NtUserGetProp( hwnd, comp_size_prop ));
+    else return FALSE;
+
+    if (!(update = NtGdiCreateRectRgn( 0, 0, 0, 0 ))) return FALSE;
+    if (!(uncovered = NtGdiCreateRectRgn( 0, 0, 0, 0 )))
     {
-        /* a long drag: let the application draw once a second all the same */
-        NtUserSetProp( hwnd, app_tick_prop, ULongToHandle( now | 1 ));
+        NtGdiDeleteObjectApp( update );
         return FALSE;
     }
-    size = HandleToULong( NtUserGetProp( hwnd, comp_size_prop ));
+    if (NtUserGetUpdateRgn( hwnd, update, FALSE ) <= NULLREGION) goto done;
+    NtGdiCombineRgn( uncovered, update, 0, RGN_COPY );
+    if ((win = get_win_ptr( hwnd )) && win != WND_OTHER_PROCESS && win != WND_DESKTOP)
+    {
+        app = win->app_dirty;  /* only this thread changes it */
+        release_win_ptr( win );
+    }
+    if (app && NtGdiCombineRgn( uncovered, uncovered, app, RGN_DIFF ) <= NULLREGION) goto done;
 
-    if (!(hdc = NtUserBeginPaint( hwnd, &ps ))) return FALSE;
-    NtGdiBitBlt( hdc, 0, 0, LOWORD(size), HIWORD(size), comp, 0, 0, SRCCOPY, 0, 0 );
-    NtUserEndPaint( hwnd, &ps );
-    NtUserSetSystemTimer( hwnd, SYSTEM_TIMER_MOVE_REPAINT, 120 );
-    return TRUE;
-}
+    if ((hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_USESTYLE )))
+    {
+        NtGdiExtSelectClipRgn( hdc, uncovered, RGN_COPY );
+        NtGdiBitBlt( hdc, 0, 0, LOWORD(size), HIWORD(size), frame, 0, 0, SRCCOPY, 0, 0 );
+        NtUserReleaseDC( hwnd, hdc );
+    }
+    NtUserRedrawWindow( hwnd, NULL, uncovered, RDW_VALIDATE | RDW_NOERASE | RDW_NOCHILDREN );
+    done = NtGdiCombineRgn( update, update, uncovered, RGN_DIFF ) <= NULLREGION;
 
-/* The moves have stopped: forget the deferral of paint_from_swapchain_frame(). */
-void end_swapchain_frame_paints( HWND hwnd )
-{
-    static const WCHAR defer_tick_prop[] = {'_','_','w','i','n','e','_','p','a','i','n','t','_','d','e','f','e','r','_','t','i','c','k',0};
-    NtUserRemoveProp( hwnd, defer_tick_prop );
+done:
+    NtGdiDeleteObjectApp( uncovered );
+    NtGdiDeleteObjectApp( update );
+    return done;
 }
 
 /* Paint the windows below parent that a moved child uncovered (or that are
@@ -2279,7 +2346,7 @@ void paint_uncovered_windows( HWND parent )
 
         if (!get_update_flags( parent, &child, &flags ) || !flags || !child) break;
         if (!is_current_thread_window( child )) break;
-        if (!paint_from_swapchain_frame( child )) send_message( child, WM_PAINT, 0, 0 );
+        if (!paint_from_frame( child )) send_message( child, WM_PAINT, 0, 0 );
     }
 }
 
@@ -2306,6 +2373,8 @@ BOOL WINAPI NtUserRedrawWindow( HWND hwnd, const RECT *rect, HRGN hrgn, UINT fla
 
         dump_rdw_flags(flags);
     }
+
+    if (flags & RDW_INVALIDATE) note_app_invalidation( hwnd, rect, hrgn );
 
     /* process pending expose events before painting */
     if (flags & RDW_UPDATENOW) check_for_events( QS_PAINT );
