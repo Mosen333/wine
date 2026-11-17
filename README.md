@@ -111,10 +111,11 @@
 |      The fork's display-driver changes are in winex11.drv;                 |
 |      winewayland.drv is unmodified.                                        |
 |    * wine.inf also sets ResizeUnframedWindows=Y for FL64.exe, so Hyprland  |
-|      can tile and resize FL Studio's main window. Prefixes made before     |
-|      that entry get it on their next update by a new runner build (or      |
-|      wineboot -u); set it by hand under HKCU\Software\Wine\AppDefaults\    |
-|      FL64.exe\X11 Driver if FL's window grows on every resize.             |
+|      can tile and resize FL Studio's main window. Without it the window    |
+|      keeps its size and only FL's own borders resize it. Prefixes made     |
+|      before the entry get it on their next update by a new runner build    |
+|      (or wineboot -u); otherwise set it under                              |
+|      HKCU\Software\Wine\AppDefaults\FL64.exe\X11 Driver.                   |
 +----------------------------------------------------------------------------+
 
 +--[ which branch ]----------------------------------------------------------+
