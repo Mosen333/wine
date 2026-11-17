@@ -1163,6 +1163,19 @@ static void window_set_wm_normal_hints( struct x11drv_win_data *data, XSizeHints
  *
  * set the window size hints
  */
+/* The scale a window manager applies to the size hints of our windows, learned from how it
+ * resizes a window of fixed size (see window_configure_notify()).  Hyprland reads the hints of
+ * XWayland windows in logical pixels under xwayland:force_zero_scaling while the window sizes
+ * are in pixels, so on a monitor scaled by 1.6 it holds a window to 1.6 times its minimum
+ * size.  1.0 for every window manager that uses the hints as they are. */
+static double size_hint_scale = 1.0;
+
+static int scale_size_hint( int size )
+{
+    if (size_hint_scale == 1.0) return size;
+    return max( (int)(size / size_hint_scale + 0.5), 1 );
+}
+
 static void set_size_hints( struct x11drv_win_data *data, DWORD style )
 {
     XSizeHints *size_hints;
@@ -1234,6 +1247,17 @@ static void set_size_hints( struct x11drv_win_data *data, DWORD style )
                 }
             }
         }
+    }
+
+    if (size_hints->flags & PMinSize)
+    {
+        size_hints->min_width = scale_size_hint( size_hints->min_width );
+        size_hints->min_height = scale_size_hint( size_hints->min_height );
+    }
+    if (size_hints->flags & PMaxSize)
+    {
+        size_hints->max_width = scale_size_hint( size_hints->max_width );
+        size_hints->max_height = scale_size_hint( size_hints->max_height );
     }
 
     window_set_wm_normal_hints( data, size_hints );
@@ -2776,28 +2800,87 @@ void window_configure_notify( struct x11drv_win_data *data, unsigned long serial
     }
 
     /* A window that can't be resized is pinned to its size with min = max size hints (see
-     * set_size_hints()), but a window manager may resize it anyway, and taking that size made it
-     * the new pinned one.  Hyprland reads the hints of XWayland windows in logical pixels under
-     * xwayland:force_zero_scaling, so on a monitor scaled by 1.6 a SUPER + right-drag gave such a
-     * window 1.6 times its size, every time (SINE Player's standalone grew past the monitor);
-     * at scale 1 the same hints keep it from being resized at all.  Keep the position the window
-     * manager chose and ask once for the size of the win32 window; if the window manager insists,
-     * its next config is adopted as before. */
-    if (!*expect_serial && data->managed && !data->is_fullscreen &&
+     * set_size_hints()), and a window manager that follows them can't resize it.  Hyprland reads
+     * the hints of XWayland windows in logical pixels under xwayland:force_zero_scaling, so on a
+     * monitor scaled by 1.6 a SUPER + right-drag gave such a window 1.6 times its size; taking that
+     * size made it the new pinned one, and every drag grew the window again (SINE Player's
+     * standalone grew past the monitor).  A window manager resizing a window of fixed size by
+     * the same factor in both directions shows the scale it gives the hints: remember it, send
+     * the hints divided by it, and ask for the size of the win32 window again.  A window that is
+     * moved to a monitor with another scale corrects it the same way. */
+    if (data->managed && !data->is_fullscreen &&
         !(data->current_state.net_wm_state & ((1 << NET_WM_STATE_MAXIMIZED) | (1 << NET_WM_STATE_FULLSCREEN))) &&
-        (value->right - value->left != desired->right - desired->left ||
-         value->bottom - value->top != desired->bottom - desired->top) &&
-        !IsRectEmpty( desired ) &&
-        !is_window_resizable( data, NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) ))
+        !IsRectEmpty( desired ))
     {
+        const XSizeHints *hints = &data->current_state.wm_normal_hints;
+        DWORD style = NtUserGetWindowLongW( data->hwnd, GWL_STYLE );
+        int width = value->right - value->left, height = value->bottom - value->top;
+        int want_width = desired->right - desired->left, want_height = desired->bottom - desired->top;
         RECT rect = *desired;
+        double scale;
 
         OffsetRect( &rect, value->left - rect.left, value->top - rect.top );
-        WARN( "%sconfig %s/%lu resizes a window of fixed size, requesting %s\n", prefix,
-              wine_dbgstr_rect(value), serial, wine_dbgstr_rect(&rect) );
-        *current = *pending = *value;
-        window_set_config( data, rect, FALSE );
-        return;
+
+        /* Hyprland can't tile a window of fixed size larger than the tile and floats it again
+         * (SUPER + T), placed by the size in its hints: with scaled hints that moved the window
+         * by half the difference to its size in pixels, on every attempt.  Keep it in place. */
+        if (size_hint_scale != 1.0 && !*expect_serial &&
+            abs( width - want_width ) <= 2 && abs( height - want_height ) <= 2 &&
+            (hints->flags & (PMinSize | PMaxSize)) == (PMinSize | PMaxSize) &&
+            hints->min_width == hints->max_width && hints->min_height == hints->max_height &&
+            (value->left != desired->left || value->top != desired->top) &&
+            abs( value->left - desired->left - (want_width - hints->min_width) / 2 ) <= 2 &&
+            abs( value->top - desired->top - (want_height - hints->min_height) / 2 ) <= 2 &&
+            !is_window_resizable( data, style ))
+        {
+            WARN( "%sconfig %s/%lu places the window by its scaled size hints, requesting %s\n", prefix,
+                  wine_dbgstr_rect(value), serial, wine_dbgstr_rect(desired) );
+            rect = *desired;
+            *current = *pending = *value;
+            window_set_config( data, rect, FALSE );
+            return;
+        }
+
+        if ((abs( width - want_width ) > 2 || abs( height - want_height ) > 2) &&
+            !is_window_resizable( data, style ))
+        {
+            if (!*expect_serial && !data->wm_normal_hints_serial &&
+                (hints->flags & (PMinSize | PMaxSize)) == (PMinSize | PMaxSize) &&
+                hints->min_width == hints->max_width && hints->min_height == hints->max_height &&
+                hints->min_width > 0 && hints->min_height > 0)
+            {
+                scale = (double)(width + height) / (hints->min_width + hints->min_height);
+                if (scale >= 0.25 && scale <= 4.0 &&
+                    abs( (int)(hints->min_width * scale + 0.5) - width ) <= 2 &&
+                    abs( (int)(hints->min_height * scale + 0.5) - height ) <= 2 &&
+                    (scale > size_hint_scale + 0.01 || scale < size_hint_scale - 0.01))
+                {
+                    WARN( "%sconfig %s/%lu scales the size hints %dx%d by %.3f, requesting %s\n", prefix,
+                          wine_dbgstr_rect(value), serial, hints->min_width, hints->min_height, scale,
+                          wine_dbgstr_rect(&rect) );
+                    size_hint_scale = scale;
+                    *current = *pending = *value;
+                    set_size_hints( data, style );
+                    window_set_config( data, rect, FALSE );
+                    return;
+                }
+            }
+
+            /* Until the window manager has the scaled hints, it goes on holding the window to
+             * the unscaled ones: a config of the win32 size times the scale (more steps of the
+             * drag, or the answer to our request crossing the new hints) is not the window
+             * manager insisting on a size, so it is not adopted either. */
+            if (size_hint_scale != 1.0 &&
+                abs( (int)(want_width * size_hint_scale + 0.5) - width ) <= 2 &&
+                abs( (int)(want_height * size_hint_scale + 0.5) - height ) <= 2)
+            {
+                WARN( "%sconfig %s/%lu still follows the unscaled size hints, requesting %s\n", prefix,
+                      wine_dbgstr_rect(value), serial, wine_dbgstr_rect(&rect) );
+                *current = *pending = *value;
+                window_set_config( data, rect, FALSE );
+                return;
+            }
+        }
     }
 
     /* if we've delayed some config we want to continue with it, make sure handle_state_change doesn't overwrite it */
