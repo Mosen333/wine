@@ -168,10 +168,10 @@ Four things are worth knowing before the first run, the first two explained in
   black, WebView2 content embedded from another process (FL Cloud) stayed black, and
   rendering was noticeably slower.
 - **FL Studio on Hyprland.** `wine.inf` also sets `ResizeUnframedWindows=Y` for
-  `FL64.exe`, so Hyprland can tile and resize FL Studio's main window. Without it, on a
-  scaled monitor the window grows by the scale factor on every resize. Prefixes made
-  before the entry get it on their next update by a new runner build (or `wineboot -u`);
-  otherwise set it under `HKCU\Software\Wine\AppDefaults\FL64.exe\X11 Driver`.
+  `FL64.exe`, so Hyprland can tile and resize FL Studio's main window. Without it the
+  window keeps its size and only FL's own borders resize it. Prefixes made before the
+  entry get it on their next update by a new runner build (or `wineboot -u`); otherwise
+  set it under `HKCU\Software\Wine\AppDefaults\FL64.exe\X11 Driver`.
 
 Details, tuning and font setup: **[PATCHES.md](PATCHES.md)**. Steinberg Cubase 15,
 Nuendo 15 and Dorico 6, from the Download Assistant to a running project:
