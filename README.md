@@ -145,7 +145,7 @@ architectures: 32-bit hosts and plugins load `d2d1`, `dcomp` and `dxgi` directly
 stale 32-bit half keeps running old code without anything visibly failing. This needs the
 `i686-w64-mingw32` cross compiler next to the x86_64 one.
 
-Four things are worth knowing before the first run, the first two explained in
+Five things are worth knowing before the first run, the first two explained in
 [PATCHES.md](PATCHES.md):
 
 - **`wine.inf` is part of the install.** It carries this fork's registry defaults,
@@ -172,6 +172,11 @@ Four things are worth knowing before the first run, the first two explained in
   window keeps its size and only FL's own borders resize it. Prefixes made before the
   entry get it on their next update by a new runner build (or `wineboot -u`); otherwise
   set it under `HKCU\Software\Wine\AppDefaults\FL64.exe\X11 Driver`.
+- **Fullscreen on Hyprland.** `wine.inf` sets `IgnoreWorkArea=Y` for the whole prefix, so
+  Wine reports the whole monitor as the work area, including the strip Hyprland's bar
+  reserves, and a window made fullscreen with SUPER + F stays fullscreen (FL Studio moved
+  itself back below the bar). In prefixes made before the entry, set it under
+  `HKCU\Software\Wine\X11 Driver`.
 
 Details, tuning and font setup: **[PATCHES.md](PATCHES.md)**. Steinberg Cubase 15,
 Nuendo 15 and Dorico 6, from the Download Assistant to a running project:
