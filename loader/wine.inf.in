@@ -457,6 +457,11 @@ HKCU,"Software\Wine\AppDefaults\Cubase15.exe","HideWineVersion",2,"Y"
 ; grew the window by the scale factor until it passed the X size limit and vanished,
 ; and FL saved that size for the next start.  Let the window manager resize it.
 HKCU,"Software\Wine\AppDefaults\FL64.exe\X11 Driver","ResizeUnframedWindows",2,"Y"
+; Hyprland's bar takes the top of the monitor off _NET_WORKAREA, but a window it makes
+; fullscreen covers the bar.  FL Studio keeps its window top at most 16 pixels above the
+; work area and moved itself out of fullscreen again (SUPER + F).  Every process of the
+; prefix shares the monitor information, so this is set for the whole prefix.
+HKCU,"Software\Wine\X11 Driver","IgnoreWorkArea",2,"Y"
 
 [DirectX]
 HKLM,Software\Microsoft\DirectX,"Version",,"4.09.00.0904"

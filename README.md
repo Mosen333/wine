@@ -116,6 +116,11 @@
 |      before the entry get it on their next update by a new runner build    |
 |      (or wineboot -u); otherwise set it under                              |
 |      HKCU\Software\Wine\AppDefaults\FL64.exe\X11 Driver.                   |
+|    * wine.inf sets IgnoreWorkArea=Y for the whole prefix: Wine reports     |
+|      the whole monitor as the work area, including the strip Hyprland's    |
+|      bar reserves, so a window made fullscreen with SUPER + F stays        |
+|      fullscreen (FL Studio moved itself back below the bar). Set it        |
+|      under HKCU\Software\Wine\X11 Driver in prefixes made before that.     |
 +----------------------------------------------------------------------------+
 
 +--[ which branch ]----------------------------------------------------------+
