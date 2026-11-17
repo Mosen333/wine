@@ -22,6 +22,15 @@ Commands:
   clean [--force]     stop the prefix now, unless it is in use (--force: regardless)
   launch [-- CMD...]  stop leftovers, then start the program (point your launcher/shortcut here)
   service [--enable]  write a systemd user service that runs `watch` with these options
+  shortcuts [--dry-run | --revert | --install-watch]
+                      point the prefix's desktop shortcuts at `launch`, so that they go through the
+                      guard; run it again after new ones were made. For a bottle: the ones Bottles
+                      made ("Add to desktop/menu"), whose own entry stays as it is: the guarded one is
+                      a file of the same name in ~/.local/share/applications, which launchers prefer.
+                      For a plain prefix: the ones Wine made for the programs installed in it
+                      (~/.local/share/applications/wine/), changed in place. --dry-run only lists the
+                      changes, --revert puts the original commands back, and --install-watch (bottles)
+                      installs a systemd user path unit that does it whenever Bottles adds a shortcut.
 
 Options:
   --bottle NAME       Bottles bottle, by name or folder (Flatpak or native Bottles)
@@ -35,12 +44,19 @@ Options:
                       bottle; that needs the .exe, from --exe or else from the --program entry in
                       bottle.yml (Bottles doesn't list every program there). The program then starts in
                       its folder, with the arguments set for it in Bottles.
-  --dry-run           watch/clean/launch: only report what would be done
+  --dry-run           watch/clean/launch/shortcuts: only report what would be done
 
 Examples:
   wine-bottle-guard --bottle "FL Studio" --keep FL64.exe,Splice.exe service --enable
   wine-bottle-guard --bottle "FL Studio" --program FL64 --exe ".../drive_c/.../FL64.exe" launch
   wine-bottle-guard --prefix ~/.wine-daw --keep FL64.exe launch -- wine "C:\\...\\FL64.exe"
+
+Shortcuts (desktop entries) that go through the guard:
+  wine-bottle-guard --bottle "FL Studio" shortcuts --dry-run       # list what would change
+  wine-bottle-guard --bottle "FL Studio" shortcuts                 # change them
+  wine-bottle-guard --bottle "FL Studio" shortcuts --install-watch # also for shortcuts made later
+  wine-bottle-guard --bottle "FL Studio" shortcuts --revert        # put Bottles' commands back
+  wine-bottle-guard --prefix ~/.wine-daw shortcuts                 # Wine's menu entries of a prefix
 
 What counts as in use: a Wine window (any window whose X11 class or Hyprland class ends in .exe,
 except Wine's untitled tray window; windows of other prefixes count too, as they can't be told
@@ -115,8 +131,9 @@ class Target:
         self.stamp_file = f"{run}/wine-bottle-guard-{key}.launch"
 
 
-def find_bottle(name):
-    """(bottle name, prefix path, 'flatpak'|'native') for a bottle given by name or folder."""
+def find_bottle(name, quiet=False):
+    """(bottle name, prefix path, 'flatpak'|'native') for a bottle given by name or folder; with quiet,
+    None if there is none."""
     for flavour, base in BOTTLES_DIRS.items():
         bottles = os.path.join(base, "bottles")
         if not os.path.isdir(bottles):
@@ -134,6 +151,8 @@ def find_bottle(name):
                 continue
             if name in (folder, display):
                 return display or folder, norm(path), flavour
+    if quiet:
+        return None
     die(f"no Bottles bottle named {name!r} in {' or '.join(BOTTLES_DIRS.values())}")
 
 
@@ -543,6 +562,416 @@ WantedBy=graphical-session.target
     return 0
 
 
+# ------------------------------------------------------------------------------------------ shortcuts
+
+APPS_DIR = os.path.expanduser("~/.local/share/applications")
+PORTAL_DIR = os.path.expanduser("~/.local/share/xdg-desktop-portal/applications")
+MARK = "X-Wine-Bottle-Guard"        # set on the entries this writes
+ORIG_KEY = "X-Wine-Bottle-Guard-Original-Exec"
+
+
+def desktop_unescape(value):
+    """A desktop entry string value as the command line it holds (spec: \\s \\n \\t \\r \\\\)."""
+    out, i = [], 0
+    while i < len(value):
+        c = value[i]
+        if c == "\\" and i + 1 < len(value):
+            out.append({"s": " ", "n": "\n", "t": "\t", "r": "\r"}.get(value[i + 1], value[i + 1]))
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def exec_quote(arg):
+    """One argument for an Exec key, quoted as the desktop entry spec wants it."""
+    if arg.startswith("%") and len(arg) == 2:
+        return arg  # a field code such as %u
+    arg = arg.replace("%", "%%")
+    if arg and not any(c in arg for c in " \t\n\"'\\><~|&;$*?#()`"):
+        q = arg
+    else:
+        q = '"' + "".join("\\" + c if c in '"`$\\' else c for c in arg) + '"'
+    return q.replace("\\", "\\\\")  # the string level escapes backslashes once more
+
+
+def read_desktop(path):
+    try:
+        with open(path, errors="replace") as f:
+            return f.read().splitlines()
+    except OSError:
+        return None
+
+
+def desktop_get(lines, key):
+    group = None
+    for line in lines:
+        if line.startswith("["):
+            group = line.strip()
+        elif group == "[Desktop Entry]" and line.split("=", 1)[0].strip() == key and "=" in line:
+            return line.split("=", 1)[1]
+    return None
+
+
+def desktop_set(lines, values):
+    """lines with the [Desktop Entry] keys in values set (None: removed), new keys at the group's end."""
+    out, group, done = [], None, set()
+    for line in lines:
+        if line.startswith("["):
+            if group == "[Desktop Entry]":
+                out += [f"{k}={v}" for k, v in values.items() if k not in done and v is not None]
+                done |= set(values)
+            group = line.strip()
+        elif group == "[Desktop Entry]" and "=" in line and line.split("=", 1)[0].strip() in values:
+            key = line.split("=", 1)[0].strip()
+            done.add(key)
+            if values[key] is not None:
+                out.append(f"{key}={values[key]}")
+            continue
+        out.append(line)
+    if group == "[Desktop Entry]":
+        out += [f"{k}={v}" for k, v in values.items() if k not in done and v is not None]
+    return out
+
+
+def parse_bottles_exec(argv):
+    """(bottle, program, exe) of a `bottles-cli run` command line, or None."""
+    try:
+        i = next(n for n, a in enumerate(argv) if a.endswith("bottles-cli") or a == "--command=bottles-cli")
+        i = argv.index("run", i + 1)
+    except (StopIteration, ValueError):
+        return None
+    found, args = {}, argv[i + 1:]
+    for n, a in enumerate(args):
+        if a == "--":
+            break
+        for key, names in (("bottle", ("-b", "--bottle")), ("program", ("-p", "--program")),
+                           ("exe", ("-e", "--executable"))):
+            if a in names and n + 1 < len(args):
+                found[key] = args[n + 1]
+            elif any(a.startswith(name + "=") for name in names if name.startswith("--")):
+                found[key] = a.split("=", 1)[1]
+    if not found.get("bottle") or not (found.get("program") or found.get("exe")):
+        return None
+    return found["bottle"], found.get("program"), found.get("exe")
+
+
+def parse_guard_exec(argv):
+    """(bottle, program, exe) of a wine-bottle-guard launch command line, or None."""
+    if not argv or not argv[0].endswith("wine-bottle-guard") or "launch" not in argv:
+        return None
+    found = {}
+    for n, a in enumerate(argv[:-1]):
+        if a in ("--bottle", "--program", "--exe"):
+            found[a[2:]] = argv[n + 1]
+    if not found.get("bottle"):
+        return None
+    return found["bottle"], found.get("program"), found.get("exe")
+
+
+def bottles_exec(flavour, bottle, program, exe):
+    cli = (["flatpak", "run", "--command=bottles-cli", "com.usebottles.bottles"]
+           if flavour == "flatpak" else ["bottles-cli"])
+    return " ".join(exec_quote(a) for a in [*cli, "run", *(["-p", program] if program else ["-e", exe]),
+                                              "-b", bottle, "--", "%u"])
+
+
+def scan_shortcuts():
+    """{desktop file id: {"file", "portal", "lines", "launch"}} of the Bottles program shortcuts; launch is
+    (bottle, program, exe, original Exec)."""
+    found = {}
+    names = set()
+    for d in (APPS_DIR, PORTAL_DIR):
+        if os.path.isdir(d):
+            names |= {n for n in os.listdir(d) if n.endswith(".desktop")}
+    for name in sorted(names):
+        apps, portal = os.path.join(APPS_DIR, name), os.path.join(PORTAL_DIR, name)
+        own = os.path.lexists(apps) and not os.path.islink(apps)
+        lines = read_desktop(apps if os.path.exists(apps) else portal)
+        if lines is None:
+            continue
+        exec_line = desktop_get(lines, "Exec")
+        if not exec_line:
+            continue
+        # only the shortcuts Bottles made: the portal's (Flatpak) or native Bottles' own, not
+        # hand-made entries that happen to call bottles-cli (URL handlers and the like)
+        made_by_bottles = (os.path.isfile(portal) or desktop_get(lines, "X-Flatpak") == "com.usebottles.bottles"
+                           or (desktop_get(lines, "Comment") or "").endswith(" using Bottles.")
+                           or desktop_get(lines, MARK) == "true")
+        if not made_by_bottles:
+            continue
+        try:
+            argv = shlex.split(desktop_unescape(exec_line))
+        except ValueError:
+            continue
+        orig = desktop_get(lines, ORIG_KEY)
+        parsed = parse_bottles_exec(argv)
+        if parsed:
+            orig = exec_line
+        else:
+            parsed = parse_guard_exec(argv)
+            if not parsed:
+                continue
+            # an entry pointed at the guard by hand or by this: Bottles' line from the portal, or a new one
+            portal_lines = read_desktop(portal) if os.path.isfile(portal) else None
+            portal_exec = desktop_get(portal_lines, "Exec") if portal_lines else None
+            try:
+                if portal_exec and parse_bottles_exec(shlex.split(desktop_unescape(portal_exec))):
+                    orig = portal_exec
+            except ValueError:
+                pass
+        found[name] = {"file": apps, "portal": portal if os.path.isfile(portal) else None, "own": own,
+                       "lines": lines, "launch": (*parsed, orig)}
+    return found
+
+
+def lnk_target(path):
+    """The Windows path a .lnk shortcut points at (its LinkInfo local base path), or None."""
+    import struct
+    try:
+        with open(path, "rb") as f:
+            data = f.read(65536)
+        if len(data) < 0x4C or struct.unpack_from("<I", data, 0)[0] != 0x4C:
+            return None
+        flags = struct.unpack_from("<I", data, 0x14)[0]
+        pos = 0x4C
+        if flags & 0x1:  # HasLinkTargetIDList
+            pos += 2 + struct.unpack_from("<H", data, pos)[0]
+        if not flags & 0x2:  # HasLinkInfo
+            return None
+        info = pos
+        header = struct.unpack_from("<I", data, info + 4)[0]
+        base_off, suffix_off = struct.unpack_from("<I", data, info + 16)[0], struct.unpack_from("<I", data, info + 24)[0]
+        if header >= 0x24:  # Unicode paths
+            ubase = struct.unpack_from("<I", data, info + 28)[0]
+            end = ubase
+            while data[info + end:info + end + 2] != b"\0\0":
+                end += 2
+            base = data[info + ubase:info + end].decode("utf-16-le", "replace")
+        else:
+            base = data[info + base_off:data.index(b"\0", info + base_off)].decode("mbcs" if os.name == "nt" else "latin-1")
+        suffix = data[info + suffix_off:data.index(b"\0", info + suffix_off)].decode("latin-1") if suffix_off else ""
+        return base + suffix
+    except (OSError, struct.error, ValueError, IndexError):
+        return None
+
+
+def unix_path(prefix, win_path):
+    """The file a C:\\ path of the prefix names, matching each component regardless of case, or None."""
+    if len(win_path) < 3 or win_path[1:3] != ":\\":
+        return None
+    path = os.path.join(prefix, f"drive_{win_path[0].lower()}")
+    for part in [p for p in win_path[3:].split("\\") if p]:
+        try:
+            match = next((n for n in os.listdir(path) if n.lower() == part.lower()), None)
+        except OSError:
+            return None
+        if match is None:
+            return None
+        path = os.path.join(path, match)
+    return path if os.path.isfile(path) else None
+
+
+def program_exe(prefix, program):
+    """The .exe of a program Bottles lists for the bottle: its bottle.yml entry, else the Start Menu or
+    desktop shortcut Bottles found it by (named after the shortcut or after its .exe), else a file
+    <program>.exe under Program Files."""
+    class _Target:
+        pass
+    t = _Target()
+    t.prefix = prefix
+    entry = bottle_programs(t).get(program)
+    if entry and entry.get("path"):
+        return entry["path"]
+    want = program.lower()
+    drive = os.path.join(prefix, "drive_c")
+    roots = [os.path.join(drive, "ProgramData/Microsoft/Windows/Start Menu")]
+    users = os.path.join(drive, "users")
+    if os.path.isdir(users):
+        for u in sorted(os.listdir(users)):
+            roots += [os.path.join(users, u, "AppData/Roaming/Microsoft/Windows/Start Menu"),
+                      os.path.join(users, u, "Desktop")]
+    for root in roots:
+        for dirpath, _, files in os.walk(root):
+            for n in sorted(files):
+                if not n.lower().endswith(".lnk"):
+                    continue
+                target = lnk_target(os.path.join(dirpath, n))
+                exe = unix_path(prefix, target) if target else None
+                if exe and want in (n[:-4].lower(), os.path.splitext(os.path.basename(exe))[0].lower()):
+                    return exe
+    for pf in ("Program Files", "Program Files (x86)"):
+        for dirpath, dirs, files in os.walk(os.path.join(drive, pf)):
+            for n in files:
+                if n.lower() == want + ".exe":
+                    return os.path.join(dirpath, n)
+    return None
+
+
+def guard_exec(bottle, program, exe):
+    script = os.path.realpath(sys.argv[0])
+    argv = [script, "--bottle", bottle, *(["--program", program] if program else []),
+            *(["--exe", exe] if exe else []), "launch", "--"]
+    return " ".join(exec_quote(a) for a in argv) + " %u"
+
+
+def write_desktop(path, lines, dry_run):
+    if dry_run:
+        return
+    if os.path.islink(path):
+        os.unlink(path)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
+def cmd_shortcuts(target, flags):
+    dry_run, revert = "--dry-run" in flags, "--revert" in flags
+    if "--install-watch" in flags:
+        return install_shortcut_watch(target, dry_run)
+    changed = 0
+    for name, sc in scan_shortcuts().items():
+        bottle, program, exe, orig = sc["launch"]
+        found = find_bottle(bottle, quiet=True)
+        if not found or found[0] != target.bottle:
+            continue  # another bottle's, or one of a bottle that is gone
+        display, prefix, flavour = found
+        label = f"{name} ({display}: {program or exe})"
+        orig = orig or bottles_exec(flavour, display, program, exe)
+        if revert:
+            if sc["portal"] and sc["own"]:
+                portal_lines = read_desktop(sc["portal"])
+                if desktop_get(portal_lines, "Exec") != orig:
+                    write_desktop(sc["portal"], desktop_set(portal_lines, {"Exec": orig}), dry_run)
+                if not dry_run:
+                    os.unlink(sc["file"])
+                    os.symlink(os.path.relpath(sc["portal"], APPS_DIR), sc["file"])
+            elif desktop_get(sc["lines"], "Exec") != orig or desktop_get(sc["lines"], MARK):
+                write_desktop(sc["file"] if sc["own"] or not sc["portal"] else sc["portal"],
+                              desktop_set(sc["lines"], {"Exec": orig, MARK: None, ORIG_KEY: None}), dry_run)
+            else:
+                continue
+            log(f"{'would put back' if dry_run else 'put back'} {label}: {orig}")
+            changed += 1
+            continue
+        # the program's .exe, so that launch can join the bottle while it is in use
+        if program and not exe:
+            exe = program_exe(prefix, program)
+            if not exe:
+                warn(f"{label}: found no .exe for {program!r}; launch can't join the bottle while it is in use")
+        new_exec = guard_exec(display, program, exe)
+        new_lines = desktop_set(sc["lines"], {"Exec": new_exec, MARK: "true", ORIG_KEY: orig})
+        if sc["own"] and new_lines == sc["lines"]:
+            continue
+        # Bottles' entry in the portal's folder keeps its own line (an earlier hand edit is undone)
+        if sc["portal"]:
+            portal_lines = read_desktop(sc["portal"])
+            if portal_lines and desktop_get(portal_lines, "Exec") != orig:
+                write_desktop(sc["portal"], desktop_set(portal_lines, {"Exec": orig, MARK: None, ORIG_KEY: None}),
+                              dry_run)
+        write_desktop(sc["file"], new_lines, dry_run)
+        log(f"{'would point' if dry_run else 'pointed'} {label} at the guard")
+        changed += 1
+    if changed and not dry_run and shutil.which("update-desktop-database"):
+        subprocess.run(["update-desktop-database", APPS_DIR], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not changed:
+        log("nothing to change")
+    return 0
+
+
+def cmd_prefix_shortcuts(target, flags):
+    """shortcuts for a plain prefix: the entries winemenubuilder wrote for its programs, which run
+    `env WINEPREFIX="..." wine ...` (no WINEPREFIX: ~/.wine); they get `launch -- <that command>`."""
+    if "--install-watch" in flags:
+        die("--install-watch is for bottles; run `shortcuts` again after installing a program")
+    dry_run, revert = "--dry-run" in flags, "--revert" in flags
+    script = os.path.realpath(sys.argv[0])
+    changed = 0
+    for dirpath, _, files in os.walk(os.path.join(APPS_DIR, "wine")):
+        for n in sorted(files):
+            if not n.endswith(".desktop"):
+                continue
+            path = os.path.join(dirpath, n)
+            lines = read_desktop(path)
+            exec_line = desktop_get(lines, "Exec") if lines else None
+            if not exec_line:
+                continue
+            orig = desktop_get(lines, ORIG_KEY) or exec_line
+            try:
+                argv = shlex.split(desktop_unescape(orig))
+            except ValueError:
+                continue
+            prefix = os.path.expanduser("~/.wine")
+            for a in argv[:3]:
+                if a.startswith("WINEPREFIX="):
+                    prefix = a.split("=", 1)[1]
+            if norm(prefix) != target.prefix or not any(os.path.basename(a).startswith("wine") for a in argv[:3]):
+                continue
+            label = os.path.relpath(path, APPS_DIR)
+            if revert:
+                if not desktop_get(lines, MARK):
+                    continue
+                new_lines = desktop_set(lines, {"Exec": orig, MARK: None, ORIG_KEY: None})
+            else:
+                # the original command already sets WINEPREFIX; launch then runs it as it is
+                new_exec = " ".join(exec_quote(a) for a in [script, "--prefix", target.prefix, "launch", "--"]) \
+                    + " " + orig
+                new_lines = desktop_set(lines, {"Exec": new_exec, MARK: "true", ORIG_KEY: orig})
+                if new_lines == lines:
+                    continue
+            write_desktop(path, new_lines, dry_run)
+            if revert:
+                log(f"{'would put back' if dry_run else 'put back'} {label}")
+            else:
+                log(f"{'would point' if dry_run else 'pointed'} {label} at the guard")
+            changed += 1
+    if changed and not dry_run and shutil.which("update-desktop-database"):
+        subprocess.run(["update-desktop-database", APPS_DIR], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not changed:
+        log("nothing to change")
+    return 0
+
+
+def install_shortcut_watch(target, dry_run=False):
+    """A systemd user path unit that runs `shortcuts` for the bottle when Bottles adds or changes a
+    shortcut; with dry_run only shown."""
+    script = os.path.realpath(sys.argv[0])
+    args = [script, "--bottle", target.bottle, "shortcuts"]
+    quoted = " ".join('"' + a.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"' for a in args)
+    slug = "".join(c if c.isalnum() else "-" for c in target.bottle).strip("-").lower()
+    name = f"wine-bottle-guard-shortcuts-{slug}"
+    paths = [PORTAL_DIR]
+    if os.path.isdir(BOTTLES_DIRS["native"]):
+        paths.append(APPS_DIR)  # native Bottles writes its shortcuts there itself
+    units = {
+        f"{name}.path": "[Unit]\nDescription=Point new Bottles shortcuts of %s at wine-bottle-guard\n\n[Path]\n"
+                        % target.bottle.replace("%", "%%")
+                        + "".join(f"PathModified={p.replace('%', '%%')}\n" for p in paths)
+                        + "\n[Install]\nWantedBy=default.target\n",
+        # the portal links its entry into ~/.local/share/applications right after writing it
+        f"{name}.service": "[Unit]\nDescription=Point new Bottles shortcuts of %s at wine-bottle-guard\n\n"
+                           "[Service]\nType=oneshot\nExecStartPre=/usr/bin/sleep 2\nExecStart=%s\n"
+                           % (target.bottle.replace("%", "%%"), quoted),
+    }
+    unit_dir = os.path.expanduser("~/.config/systemd/user")
+    for unit, text in units.items():
+        if dry_run:
+            print(f"# {os.path.join(unit_dir, unit)}\n{text}")
+            continue
+        os.makedirs(unit_dir, exist_ok=True)
+        with open(os.path.join(unit_dir, unit), "w") as f:
+            f.write(text)
+    if dry_run:
+        return 0
+    os.makedirs(PORTAL_DIR, exist_ok=True)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", "--now", f"{name}.path"], check=True)
+    print(f"installed and enabled {name}.path; follow it with: journalctl --user -u {name} -f")
+    return 0
+
+
 # ----------------------------------------------------------------------------------------------- main
 
 def main():
@@ -572,7 +1001,7 @@ def main():
             target_argv += [a, argv[i + 1]]
             i += 2
             continue
-        if a in ("--dry-run", "--force", "--enable"):
+        if a in ("--dry-run", "--force", "--enable", "--revert", "--install-watch"):
             flags.add(a)
         elif cmd is None and not a.startswith("-"):
             cmd = a
@@ -580,6 +1009,10 @@ def main():
             die(f"unknown argument {a!r} (see --help)")
         i += 1
     target = Target(opts)
+    if cmd == "shortcuts":
+        if target.bottle:
+            return cmd_shortcuts(target, flags)
+        return cmd_prefix_shortcuts(target, flags)
     cmd = cmd or "status"
     if cmd == "status":
         return cmd_status(target)
