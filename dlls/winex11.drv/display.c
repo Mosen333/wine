@@ -352,6 +352,17 @@ RECT get_work_area(const RECT *monitor_rect)
     long *work_area;
     RECT work_rect;
 
+    /* Panels of a tiling compositor (Hyprland's bar) reserve a strip of the monitor that
+     * _NET_WORKAREA takes off, but a window the compositor makes fullscreen covers it.  FL
+     * Studio keeps the top of its window at most 16 pixels above the work area, so it moved
+     * itself back down from y = 0 and the fullscreen state was dropped again (SUPER + F).
+     * Optionally report the whole monitor; the compositor places windows itself anyway. */
+    if (ignore_work_area)
+    {
+        TRACE( "ignoring the work area, using the monitor %s\n", wine_dbgstr_rect(monitor_rect) );
+        return *monitor_rect;
+    }
+
     /* Try _GTK_WORKAREAS first as _NET_WORKAREA may be incorrect on multi-monitor systems */
     if (!XGetWindowProperty(gdi_display, DefaultRootWindow(gdi_display),
                             x11drv_atom(_GTK_WORKAREAS_D0), 0, ~0, False, XA_CARDINAL, &type,
