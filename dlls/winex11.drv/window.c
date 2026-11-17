@@ -2808,6 +2808,31 @@ void window_configure_notify( struct x11drv_win_data *data, unsigned long serial
         }
     }
 
+    /* A window that can't be resized is pinned to its size with min = max size hints (see
+     * set_size_hints()), but a window manager may resize it anyway, and taking that size made it
+     * the new pinned one.  Hyprland reads the hints of XWayland windows in logical pixels under
+     * xwayland:force_zero_scaling, so on a monitor scaled by 1.6 a SUPER + right-drag gave such a
+     * window 1.6 times its size, every time (SINE Player's standalone grew past the monitor);
+     * at scale 1 the same hints keep it from being resized at all.  Keep the position the window
+     * manager chose and ask once for the size of the win32 window; if the window manager insists,
+     * its next config is adopted as before. */
+    if (!*expect_serial && data->managed && !data->is_fullscreen &&
+        !(data->current_state.net_wm_state & ((1 << NET_WM_STATE_MAXIMIZED) | (1 << NET_WM_STATE_FULLSCREEN))) &&
+        (value->right - value->left != desired->right - desired->left ||
+         value->bottom - value->top != desired->bottom - desired->top) &&
+        !IsRectEmpty( desired ) &&
+        !is_window_resizable( data, NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) ))
+    {
+        RECT rect = *desired;
+
+        OffsetRect( &rect, value->left - rect.left, value->top - rect.top );
+        WARN( "%sconfig %s/%lu resizes a window of fixed size, requesting %s\n", prefix,
+              wine_dbgstr_rect(value), serial, wine_dbgstr_rect(&rect) );
+        *current = *pending = *value;
+        window_set_config( data, rect, FALSE );
+        return;
+    }
+
     /* if we've delayed some config we want to continue with it, make sure handle_state_change doesn't overwrite it */
     if ((*expect_serial || window_needs_config_change_delay( data )) &&
         serial >= *expect_serial && !EqualRect( desired, pending ))
