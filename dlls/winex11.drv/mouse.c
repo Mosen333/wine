@@ -1804,7 +1804,7 @@ BOOL X11DRV_EnterNotify( HWND hwnd, XEvent *xev )
  * clip it: the pointer then really leaves through a point inside the X window, onto the window next
  * to it, and Xwayland already has it there.  Only a pointer the X server no longer sees, on a
  * decoration the compositor draws, is still reported on the window it left. */
-static BOOL pointer_still_on_window( Display *display, Window window )
+BOOL pointer_still_on_window( Display *display, Window window )
 {
     Window root, parent, child, *children, top = window;
     int root_x, root_y, win_x, win_y;
