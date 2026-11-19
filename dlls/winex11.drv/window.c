@@ -2572,6 +2572,16 @@ BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, 
         /* the pointer left this window onto a decoration the X server cannot see (X11DRV_LeaveNotify)
          * and the window manager is moving the window under it: move the stale pointer position
          * along, so that the WM_MOUSEMOVE the server synthesizes after the move stays outside */
+        /* only while the X server still has the pointer on this window: once it is on another X
+         * window, the stale position is outdated -- Splice, tiled below its minimum size, got a
+         * config every 1.5 s and moved the pointer of every Wine process in the prefix back to
+         * its edge, also while the user dragged in FL Studio's mixer */
+        if (*swp_flags && thread_data->stale_leave_hwnd == hwnd &&
+            !pointer_still_on_window( data->display, data->whole_window ))
+        {
+            TRACE( "hwnd %p moved by the window manager, the pointer is on another window now\n", hwnd );
+            thread_data->stale_leave_hwnd = 0;
+        }
         if ((follow = *swp_flags && thread_data->stale_leave_hwnd == hwnd))
         {
             stale_pt.x = data->current_state.rect.left + thread_data->stale_leave_rel.x;
