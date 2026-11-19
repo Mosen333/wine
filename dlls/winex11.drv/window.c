@@ -629,8 +629,12 @@ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, BOOL fullscreen )
      * and WebView2 carry at least one of these extended styles and stay unmanaged.
      * Wine's own popup menus (class #32768) are owned WS_POPUP windows with ex style 0 when
      * created and only become topmost when shown; managed, the first click into one activates
-     * it, the owner loses the activation and the menu closes before the item is chosen. */
-    if ((style & WS_POPUP) && NtUserGetWindowRelative( hwnd, GW_OWNER ) &&
+     * it, the owner loses the activation and the menu closes before the item is chosen.
+     * Only once the popup is shown: a window can't become unmanaged again, and FL Studio sets
+     * up its menus hidden with WS_EX_CONTROLPARENT alone and adds WS_EX_TOPMOST as it shows
+     * them, so the decision made while they were hidden left every FL menu managed. */
+    if ((style & WS_POPUP) && ((style & WS_VISIBLE) || (swp_flags & SWP_SHOWWINDOW)) &&
+        NtUserGetWindowRelative( hwnd, GW_OWNER ) &&
         NtUserGetClassLongW( hwnd, GCW_ATOM ) != 32768 /* POPUPMENU_CLASS_ATOM */ &&
         !(ex_style & (WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE)))
     {
