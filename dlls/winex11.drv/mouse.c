@@ -1818,6 +1818,25 @@ static BOOL pointer_still_on_window( Display *display, Window window )
     return child == top;
 }
 
+/* XCheckIfEvent() predicate that only notes an EnterNotify for the window in *arg (it then
+ * clears it) and never takes an event out of the queue */
+static Bool note_queued_enter( Display *display, XEvent *event, XPointer arg )
+{
+    Window *window = (Window *)arg;
+
+    if (event->type == EnterNotify && event->xcrossing.window == *window) *window = 0;
+    return False;
+}
+
+/* Is an EnterNotify for this window already queued behind its LeaveNotify? */
+static BOOL enter_queued( Display *display, Window window )
+{
+    XEvent event;
+
+    XCheckIfEvent( display, &event, note_queued_enter, (XPointer)&window );
+    return !window;
+}
+
 BOOL X11DRV_LeaveNotify( HWND hwnd, XEvent *xev )
 {
     struct x11drv_thread_data *thread_data = x11drv_thread_data();
@@ -1852,8 +1871,14 @@ BOOL X11DRV_LeaveNotify( HWND hwnd, XEvent *xev )
      * item by item).  A leave to the ancestor from a point inside the window is impossible
      * otherwise, so put the pointer just outside the edge it left through, and keep it there
      * relative to the window while the window manager moves it (X11DRV_GetWindowStateUpdates). */
+    /* Xwayland also sends a leave and an enter at the same point when the compositor only moves
+     * the pointer focus away and back (Hyprland on a resize, a re-tile or a focus change): 17 of
+     * 23 such leaves had their enter in the same millisecond.  The pointer did not leave then, and
+     * putting it outside the edge moved the cursor position of every Wine process in the prefix
+     * there for a moment -- Splice tiled beside FL Studio placed FL's pointer at Splice's edge. */
     if (event->mode == NotifyNormal && (event->detail == NotifyAncestor || event->detail == NotifyVirtual) &&
         is_xwayland() && pointer_still_on_window( event->display, event->window ) &&
+        !enter_queued( event->display, event->window ) &&
         (data = get_win_data( hwnd )))
     {
         int x = event->x, y = event->y, w = data->rects.visible.right - data->rects.visible.left,
