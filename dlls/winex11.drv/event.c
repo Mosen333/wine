@@ -770,7 +770,19 @@ static void focus_out( Display *display , HWND hwnd )
     xim_set_focus( hwnd, FALSE );
 
     if (is_virtual_desktop()) return;
-    if (hwnd != NtUserGetForegroundWindow()) return;
+    if (hwnd != NtUserGetForegroundWindow())
+    {
+        /* The foreground may be a window owned by this one that the window manager never gave
+         * the X focus: FL Studio activates its F8 plug-in picker, which a Hyprland rule keeps
+         * from taking the focus, so the X focus stays on FL's main window.  When it left for a
+         * Wayland window, the picker was never deactivated and stayed open, and the compositor
+         * sent the pointer over it to the windows below. */
+        HWND owner = NtUserGetForegroundWindow();
+
+        while (owner && owner != hwnd) owner = NtUserGetWindowRelative( owner, GW_OWNER );
+        if (!owner) return;
+        TRACE( "focus out of %p, owner of the foreground window %p\n", hwnd, NtUserGetForegroundWindow() );
+    }
     if (!(NtUserGetWindowLongW( hwnd, GWL_STYLE ) & WS_MINIMIZE))
         send_message( hwnd, WM_CANCELMODE, 0, 0 );
 
