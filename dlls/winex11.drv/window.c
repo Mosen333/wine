@@ -3225,6 +3225,12 @@ BOOL window_has_pending_wm_state( HWND hwnd, UINT state )
 BOOL window_should_take_focus( HWND hwnd, Time time )
 {
     Time focus_time = (UINT_PTR)NtUserGetProp( hwnd, focus_time_prop );
+
+    /* A window manager that sends CurrentTime gives no order to compare: Hyprland's sends
+     * every WM_TAKE_FOCUS with time 0, which was never newer than the focus time of the
+     * foreground window, so once Splice next to FL Studio had been the foreground, FL never
+     * became it again and every key typed into FL went to Splice.  Take it as now. */
+    if (!time) return TRUE;
     return !focus_time || time > focus_time;
 }
 
